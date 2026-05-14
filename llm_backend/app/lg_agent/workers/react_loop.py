@@ -159,7 +159,7 @@ def observe_node(state: WorkerState, *, config: RunnableConfig) -> Dict[str, Any
     }
 
 
-def make_think_node(llm: BaseChatModel, worker_type: str, tool_schemas: list):
+def make_think_node(llm: BaseChatModel, worker_type: str, tool_schemas: list, identity: str = ""):
     """创建 Think 节点 — 唯一的 LLM 调用"""
 
     # Build prompt with dynamic tool descriptions
@@ -167,7 +167,7 @@ def make_think_node(llm: BaseChatModel, worker_type: str, tool_schemas: list):
         f"- **{t.__name__}**: {t.__doc__ or 'No description'}"
         for t in tool_schemas
     )
-    system_prompt = build_think_prompt(worker_type, tool_descriptions)
+    system_prompt = build_think_prompt(worker_type, tool_descriptions, identity=identity)
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
@@ -207,11 +207,11 @@ def finish_node(state: WorkerState) -> Dict[str, Any]:
     }
 
 
-def build_worker_graph(worker_type: str, llm: BaseChatModel, tool_schemas: list) -> StateGraph:
+def build_worker_graph(worker_type: str, llm: BaseChatModel, tool_schemas: list, identity: str = "") -> StateGraph:
     """构建 Worker ReAct 子图"""
     builder = StateGraph(WorkerState)
 
-    think_node_fn = make_think_node(llm, worker_type, tool_schemas)
+    think_node_fn = make_think_node(llm, worker_type, tool_schemas, identity=identity)
 
     builder.add_node("think", think_node_fn)
     builder.add_node("act", act_node)

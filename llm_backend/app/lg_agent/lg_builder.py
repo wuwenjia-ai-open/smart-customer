@@ -14,27 +14,13 @@ from app.lg_agent.supervisor.nodes import (
     make_merge_node,
     respond_node,
 )
-from app.lg_agent.workers.react_loop import build_worker_graph
-from app.lg_agent.workers.tools.schemas import (
-    semantic_search, compare_products, recommend,
-    track_shipment, create_ticket, ask_clarification, escalate_to_human,
-    predefined_cypher, cypher_query,
-)
+from app.lg_agent.workers import product_qa, order_qa, after_sales, general_chat
 from app.lg_agent.workers.tools.registry import register_tool
 from app.lg_agent.workers.tools.executors import (
     AskClarificationExecutor, EscalateToHumanExecutor,
 )
 
 _log = logging.getLogger(__name__)
-
-
-# ── Tool -> Worker mapping ──
-WORKER_TOOL_MAP = {
-    "product_qa": [semantic_search, compare_products, recommend, predefined_cypher, cypher_query, ask_clarification],
-    "order_qa": [track_shipment, predefined_cypher, cypher_query, ask_clarification],
-    "after_sales": [create_ticket, escalate_to_human, predefined_cypher, cypher_query, ask_clarification],
-    "general_chat": [ask_clarification],
-}
 
 
 # ── Lazy tool registry initialization ──
@@ -97,8 +83,10 @@ def build_supervisor_graph() -> StateGraph:
     builder.add_node("respond", respond_node)
 
     # ── Worker sub-graphs ──
-    for worker_type, tool_schemas in WORKER_TOOL_MAP.items():
-        worker_graph = build_worker_graph(worker_type, llm, tool_schemas)
+    for worker in [product_qa, order_qa, after_sales, general_chat]:
+        worker_graph = worker.build(llm)
+        # extract worker_type from module name: "product_qa" etc.
+        worker_type = worker.__name__.split(".")[-1]
         builder.add_node(worker_type, worker_graph)
 
     # ── Edges ──
