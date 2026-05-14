@@ -41,8 +41,8 @@ WORKER_TOOL_MAP = {
 def _init_tool_registry():
     """延迟初始化工具注册表（需要 Neo4j/Milvus 连接）"""
     try:
-        from app.lg_agent.kg_sub_graph.neo4j_conn import get_neo4j_graph
-        from app.lg_agent.kg_sub_graph.agentic_rag_agents.components.predefined_cypher.cypher_dict import predefined_cypher_dict
+        from app.lg_agent.data.neo4j_conn import get_neo4j_graph
+        from app.lg_agent.data.cypher_dict import predefined_cypher_dict
         from app.lg_agent.workers.tools.executors import (
             SemanticSearchExecutor, CompareProductsExecutor, RecommendExecutor,
             TrackShipmentExecutor, CreateTicketExecutor,
@@ -54,8 +54,8 @@ def _init_tool_registry():
         milvus = None
         embed = None
         try:
-            from app.lg_agent.kg_sub_graph.agentic_rag_agents.components.predefined_cypher.utils import create_vector_query_matcher
-            from app.lg_agent.kg_sub_graph.agentic_rag_agents.components.predefined_cypher.descriptions import QUERY_DESCRIPTIONS
+            from app.lg_agent.data.vector_matcher import create_vector_query_matcher
+            from app.lg_agent.data.descriptions import QUERY_DESCRIPTIONS
             matcher = create_vector_query_matcher(predefined_cypher_dict, QUERY_DESCRIPTIONS)
             milvus = matcher._milvus
             embed = matcher._embedding
