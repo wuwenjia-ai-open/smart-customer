@@ -78,3 +78,8 @@ class AgentState(InputState):
 
     hallucination: GradeHallucinations = field(default_factory=lambda: GradeHallucinations(binary_score="0"))
     """幻觉检测结果，binary_score='1' 表示答案有依据，'0' 表示存在幻觉。"""
+
+
+# === Multi-Agent types (added for feat/multi-agent) ===
+from app.lg_agent.workers.state import WorkerState, ToolCallRecord  # noqa: F401
+from app.lg_agent.supervisor.state import SupervisorState, SubTask, WorkerResult  # noqa: F401
