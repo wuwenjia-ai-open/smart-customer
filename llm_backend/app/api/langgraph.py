@@ -12,7 +12,7 @@ from app.core.logger import get_logger
 from app.core.config import settings
 from app.lg_agent.lg_states import InputState
 from app.lg_agent.utils import new_uuid
-from app.lg_agent.lg_builder import graph
+from app.lg_agent.lg_builder import supervisor_graph as graph
 from langgraph.types import Command
 
 router = APIRouter()
