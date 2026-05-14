@@ -1,5 +1,5 @@
 """OrderQA Worker — 订单查询/物流追踪"""
-from app.lg_agent.workers.react_loop import build_worker_graph
+from app.lg_agent.workers.react_loop import build_worker
 from app.lg_agent.workers.tools.schemas import (
     track_shipment, predefined_cypher, cypher_query, ask_clarification,
 )
@@ -15,4 +15,9 @@ TOOLS = [track_shipment, predefined_cypher, cypher_query, ask_clarification]
 
 
 def build(llm):
-    return build_worker_graph("order_qa", llm, TOOLS, identity=IDENTITY)
+    tool_descriptions = "\n".join(
+        f"- **{t.__name__}**: {t.__doc__ or 'No description'}"
+        for t in TOOLS
+    )
+    system_prompt = build_think_prompt("order_qa", tool_descriptions, identity=IDENTITY)
+    return build_worker(llm, TOOLS, system_prompt, "order_qa")

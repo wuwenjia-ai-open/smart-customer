@@ -1,5 +1,5 @@
 """AfterSales Worker — 售后/FAQ/工单"""
-from app.lg_agent.workers.react_loop import build_worker_graph
+from app.lg_agent.workers.react_loop import build_worker
 from app.lg_agent.workers.tools.schemas import (
     create_ticket, escalate_to_human, predefined_cypher, cypher_query, ask_clarification,
 )
@@ -15,4 +15,9 @@ TOOLS = [create_ticket, escalate_to_human, predefined_cypher, cypher_query, ask_
 
 
 def build(llm):
-    return build_worker_graph("after_sales", llm, TOOLS, identity=IDENTITY)
+    tool_descriptions = "\n".join(
+        f"- **{t.__name__}**: {t.__doc__ or 'No description'}"
+        for t in TOOLS
+    )
+    system_prompt = build_think_prompt("after_sales", tool_descriptions, identity=IDENTITY)
+    return build_worker(llm, TOOLS, system_prompt, "after_sales")

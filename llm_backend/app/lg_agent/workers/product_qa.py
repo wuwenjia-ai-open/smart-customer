@@ -1,5 +1,5 @@
 """ProductQA Worker — 产品查询/对比/推荐"""
-from app.lg_agent.workers.react_loop import build_worker_graph
+from app.lg_agent.workers.react_loop import build_worker
 from app.lg_agent.workers.tools.schemas import (
     semantic_search, compare_products, recommend,
     predefined_cypher, cypher_query, ask_clarification,
@@ -16,4 +16,9 @@ TOOLS = [semantic_search, compare_products, recommend, predefined_cypher, cypher
 
 
 def build(llm):
-    return build_worker_graph("product_qa", llm, TOOLS, identity=IDENTITY)
+    tool_descriptions = "\n".join(
+        f"- **{t.__name__}**: {t.__doc__ or 'No description'}"
+        for t in TOOLS
+    )
+    system_prompt = build_think_prompt("product_qa", tool_descriptions, identity=IDENTITY)
+    return build_worker(llm, TOOLS, system_prompt, "product_qa")

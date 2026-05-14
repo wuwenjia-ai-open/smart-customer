@@ -12,5 +12,5 @@ class InputState:
 
 
 # === Multi-Agent types (added for feat/multi-agent) ===
-from app.lg_agent.workers.state import WorkerState, ToolCallRecord  # noqa: F401
+from app.lg_agent.workers.state import WorkerState  # noqa: F401
 from app.lg_agent.supervisor.state import SupervisorState, SubTask, WorkerResult  # noqa: F401
