@@ -9,7 +9,6 @@ class Router(TypedDict):
     """对用户查询进行分类。"""
     logic: str
     type: Literal["general-query", "additional-query", "graphrag-query", "image-query"]
-    question: str = field(default_factory=str)
 
 
 class GradeHallucinations(BaseModel):

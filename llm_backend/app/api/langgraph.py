@@ -67,7 +67,7 @@ async def langgraph_query(
                         user_id=user_id, title=query[:30], thread_id=thread_id
                     )
                 except Exception:
-                    pass
+                    logger.warning(f"Failed to create conversation record for thread {thread_id}, proceeding without persistence")
             yield f"data: {json.dumps({'status': 'thinking', 'msg': '对方正在输入...'})}\n\n"
             try:
                 stream_input = InputState(messages=query)
@@ -83,8 +83,8 @@ async def langgraph_query(
                 if not answer:
                     answer = str(result.get("answer", "") or result.get("summary", ""))
                 if answer:
-                    for i in range(0, len(answer), 4):
-                        yield f"data: {json.dumps(answer[i:i+4], ensure_ascii=False)}\n\n"
+                    for i in range(0, len(answer), 32):
+                        yield f"data: {json.dumps(answer[i:i+32], ensure_ascii=False)}\n\n"
                     return
                 yield f"data: {json.dumps('抱歉，我暂时无法回答这个问题，请稍后再试或换个问法～')}\n\n"
             except Exception:

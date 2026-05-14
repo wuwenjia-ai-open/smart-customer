@@ -84,18 +84,15 @@ def create_cypher_query_node(llm: BaseChatModel, graph: Neo4jGraph, max_retries:
                 if statement.endswith("```"):
                     statement = statement[:-3]
             statement = statement.strip()
-            print(f"  Cypher (attempt {attempt+1}): {statement[:150]}")
 
             # 语法校验 — 用 EXPLAIN 检查
             try:
                 graph.query(f"EXPLAIN {statement}")
                 result = graph.query(statement)
                 records = result if result else []
-                print(f"  → {len(records)} records")
                 break
             except Exception as e:
                 errors.append(str(e))
-                print(f"  → failed: {str(e)[:100]}")
                 if attempt < max_retries:
                     task = f"原始问题: {task}\n上一次查询 '{statement}' 失败: {str(e)[:200]}\n请修正后重新生成。"
                 else:

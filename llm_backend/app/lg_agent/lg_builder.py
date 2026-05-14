@@ -11,6 +11,7 @@
 #   ├── graphrag-query   → create_research_plan（知识图谱检索 + 多工具子图）
 #   └── image-query      → create_image_query（视觉模型分析图片）
 
+from app.core.config import settings
 from app.lg_agent.lg_states import AgentState, Router, InputState
 from app.lg_agent.lg_prompts import (
     ROUTER_SYSTEM_PROMPT,
@@ -19,12 +20,12 @@ from app.lg_agent.lg_prompts import (
     GUARDRAILS_SYSTEM_PROMPT,
 )
 from langchain_core.runnables import RunnableConfig
-from app.core.config import settings
 from app.services.llm_factory import LLMFactory
 from app.core.logger import get_logger
 from typing import cast, Literal, List, Dict, Any
 from langchain_core.messages import BaseMessage, AIMessage
-from langgraph.checkpoint.memory import MemorySaver
+import sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from app.lg_agent.kg_sub_graph.agentic_rag_agents.workflows.multi_agent.multi_tool import create_multi_tool_workflow
 from app.lg_agent.kg_sub_graph.tools import predefined_cypher, cypher_query
@@ -276,7 +277,8 @@ async def create_research_plan(
 
 # ── 构建状态机图 ───────────────────────────────────────────────────────────────
 
-checkpointer = MemorySaver()
+conn = sqlite3.connect(settings.CHECKPOINT_DB_PATH, check_same_thread=False)
+checkpointer = SqliteSaver(conn)
 
 builder = StateGraph(AgentState, input=InputState)
 

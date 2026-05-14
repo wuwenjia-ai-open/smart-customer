@@ -42,7 +42,6 @@ def create_check_hallucinations_node(llm: BaseChatModel, max_retries: int = 3) -
         score = result.score if hasattr(result, "score") else "yes"
 
         if score in ("no", "half") and count < max_retries:
-            print(f"  幻觉检测: {score} → 重新生成 (第{count+1}次)")
             return {"next_action": "summarize", "hallucination_count": count + 1, "steps": ["check_hallucinations"]}
 
         return {"next_action": "end", "steps": ["check_hallucinations"]}

@@ -46,7 +46,6 @@ def create_planner_node(llm: BaseChatModel) -> Callable:
         if not tasks:
             tasks = [Task(question=question, parent_task=question)]
 
-        print(f"  Planner: {len(tasks)} sub-tasks")
         return {"tasks": tasks, "steps": ["planner"]}
 
     return planner

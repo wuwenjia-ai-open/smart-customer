@@ -38,13 +38,3 @@ async def chat_endpoint(request: ChatRequest):
     except Exception as e:
         logger.error(f"Chat error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/search")
-async def search_endpoint(request: ChatRequest):
-    try:
-        logger.info(f"Search request (fallback to chat) user={request.user_id}")
-        return _create_chat_stream(request)
-    except Exception as e:
-        logger.error(f"Search/Chat error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))

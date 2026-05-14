@@ -70,7 +70,7 @@ def create_predefined_cypher_node(
             oid = _re.search(r'(\d+)', task)
             if oid: kw_map.append(('order_shipping', {'order_id': int(oid.group(1))}))
         # 价格
-        if _re.search(r'(价格|多少钱|便宜|低价|便宜|低于|价位|预算|之间|以下|以上|不超过|以内)', _task_lower):
+        if _re.search(r'(价格|多少钱|便宜|低价|低于|价位|预算|之间|以下|以上|不超过|以内)', _task_lower):
             prices = _re.findall(r'(\d+)', task)
             if len(prices) >= 2:
                 kw_map.append(('products_price_range', {'min_price': int(prices[0]), 'max_price': int(prices[1])}))

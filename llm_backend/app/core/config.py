@@ -1,4 +1,5 @@
-from pydantic_settings import BaseSettings
+from urllib.parse import quote_plus
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).parent.parent.parent
@@ -55,12 +56,16 @@ class Settings(BaseSettings):
 
     @property
     def DATABASE_URL(self) -> str:
-        return f"mysql+aiomysql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        return f"mysql+aiomysql://{quote_plus(self.DB_USER)}:{quote_plus(self.DB_PASSWORD)}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
 
-    class Config:
-        env_file = str(ENV_FILE)
-        env_file_encoding = "utf-8"
-        case_sensitive = True
-        extra = "ignore"
+    model_config = SettingsConfigDict(
+        env_file=str(ENV_FILE),
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore",
+    )
 
 settings = Settings()
+
+if not settings.SECRET_KEY:
+    raise ValueError("SECRET_KEY must be set in .env — cannot start without it")

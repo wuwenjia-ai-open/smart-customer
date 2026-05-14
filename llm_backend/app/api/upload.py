@@ -14,6 +14,21 @@ logger = get_logger(service="upload")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".pdf", ".doc", ".docx", ".txt", ".csv"}
+ALLOWED_MIMES = {
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+    "application/pdf", "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "text/plain", "text/csv",
+}
+
+def _validate_file(file: UploadFile) -> None:
+    content = file.filename or ""
+    ext = content.rsplit(".", 1)[-1].lower() if "." in content else ""
+    if f".{ext}" not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"不支持的文件类型: .{ext}")
+
 
 @router.post("/upload")
 async def upload_file(
@@ -21,6 +36,10 @@ async def upload_file(
     user_id: int = Form(...),
 ):
     try:
+        _validate_file(file)
+        content = await file.read()
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail=f"文件大小超过限制 ({MAX_FILE_SIZE // 1024 // 1024}MB)")
         logger.info(f"Uploading file for user {user_id}: {file.filename}")
         user_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"user_{user_id}"))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -31,7 +50,6 @@ async def upload_file(
         new_filename = f"{original_name}_{timestamp}{ext}"
         file_path = target_dir / new_filename
 
-        content = await file.read()
         with open(file_path, "wb") as f:
             f.write(content)
 
@@ -58,6 +76,10 @@ async def upload_image(
     conversation_id: Optional[str] = Form(None),
 ):
     try:
+        _validate_file(image)
+        content = await image.read()
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail=f"图片大小超过限制 ({MAX_FILE_SIZE // 1024 // 1024}MB)")
         image_dir = Path("uploads/images")
         if conversation_id:
             image_dir = image_dir / conversation_id
@@ -68,7 +90,6 @@ async def upload_image(
         new_filename = f"{original_name}_{timestamp}{ext}"
         image_path = image_dir / new_filename
 
-        content = await image.read()
         with open(image_path, "wb") as f:
             f.write(content)
 
