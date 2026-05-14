@@ -1,9 +1,9 @@
-"""Worker Agent — LangGraph create_react_agent 薄封装"""
+"""Worker Agent — LangChain create_agent 薄封装"""
 import logging
 from operator import add
 from typing import Annotated, Any, Dict, List
 
-from langgraph.prebuilt.chat_agent_executor import create_react_agent
+from langchain.agents import create_agent
 from langgraph.graph import StateGraph, START, END, add_messages
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage
@@ -25,12 +25,12 @@ class WorkerOutputState(TypedDict):
 
 
 def build_worker(llm: BaseChatModel, tools: list, system_prompt: str, worker_type: str) -> StateGraph:
-    """构建 Worker Agent — create_react_agent + 结果提取"""
+    """构建 Worker Agent — create_agent + 结果提取"""
 
-    react_agent = create_react_agent(
+    react_agent = create_agent(
         llm,
         tools,
-        prompt=system_prompt,
+        system_prompt=system_prompt,
     )
 
     builder = StateGraph(WorkerInternalState, output_schema=WorkerOutputState)

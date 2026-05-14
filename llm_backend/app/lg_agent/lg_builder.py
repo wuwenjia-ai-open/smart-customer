@@ -1,7 +1,8 @@
 """Multi-Agent Supervisor Graph — 替代原单 Agent Pipeline"""
 import logging
+import sqlite3
 
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 from app.core.config import settings
@@ -120,8 +121,9 @@ def build_supervisor_graph() -> StateGraph:
     })
     builder.add_edge("respond", END)
 
-    # ── Checkpointer ──
-    checkpointer = MemorySaver()
+    # ── Checkpointer (SQLite 持久化) ──
+    conn = sqlite3.connect(settings.CHECKPOINT_DB_PATH, check_same_thread=False)
+    checkpointer = SqliteSaver(conn)
 
     return builder.compile(checkpointer=checkpointer)
 
