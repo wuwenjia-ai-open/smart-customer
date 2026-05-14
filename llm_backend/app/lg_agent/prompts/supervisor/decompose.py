@@ -10,8 +10,8 @@ DECOMPOSE_SYSTEM_PROMPT = """你是任务拆解专家。用户问题需要多个
 
 输出 JSON 数组：
 [
-  {"worker_type": "order_qa", "description": "...", "context": {"order_id": 12345}, "priority": 1},
-  {"worker_type": "product_qa", "description": "...", "context": {}, "priority": 1}
+  {{"worker_type": "order_qa", "description": "...", "context": {{"order_id": 12345}}, "priority": 1}},
+  {{"worker_type": "product_qa", "description": "...", "context": {{}}, "priority": 1}}
 ]
 """
 
