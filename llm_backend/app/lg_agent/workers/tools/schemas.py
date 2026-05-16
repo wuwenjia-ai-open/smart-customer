@@ -47,10 +47,12 @@ class create_ticket(BaseModel):
 
 class ask_clarification(BaseModel):
     """【澄清提问】当任务信息不足时，向用户提出精准的澄清问题。
-    此工具不执行查询，调用后 Worker 将暂停并等待用户回应。"""
+    此工具不执行查询，调用后 Worker 将暂停并等待用户回应。
+    如果发现当前 Worker 无法处理（如 product_qa 收到售后问题），设置 reroute_to。"""
     question: str = Field(..., description="向用户提出的澄清问题，单句，不超过30字")
     missing_field: str = Field(..., description="缺失的关键字段，如'order_id','product_name'")
     options: Optional[List[str]] = Field(default=None, description="可选澄清选项")
+    reroute_to: Optional[str] = Field(default=None, description="如果当前 Worker 无法处理，建议转发的目标 Worker: product_qa|order_qa|after_sales|general_chat")
 
 
 class escalate_to_human(BaseModel):
@@ -61,18 +63,9 @@ class escalate_to_human(BaseModel):
     urgency: Literal["normal", "urgent", "critical"] = Field(default="normal", description="紧急程度")
 
 
-# ── 复用现有工具（直接内联，不再依赖 kg_sub_graph） ──
-
-class predefined_cypher(BaseModel):
-    """【快】向量匹配预定义查询，直接执行，适合 90% 常见问题。
-    支持：产品/价格筛选、订单查询、物流追踪、评价查询、员工管理等。
-    当问题明确、可归类时优先使用此工具。"""
-    query: str = Field(..., description="匹配到的预定义查询名称")
-    parameters: dict = Field(default_factory=dict, description="查询参数")
+class search_faq(BaseModel):
+    """【FAQ搜索】在知识库中搜索常见问题答案。
+    适用："退货流程是什么"、"保修多久"、"怎么开发票" 等政策类问题。"""
+    keyword: str = Field(..., description="搜索关键词，如'退货'、'保修'、'配送'、'发票'")
 
 
-class cypher_query(BaseModel):
-    """【准】LLM 动态生成 Cypher 查询，适合复杂/自定义问题。
-    根据 Neo4j Schema 和 few-shot 示例动态生成查询语句，
-    经过语法校验后执行。当预定义查询无法覆盖时使用此工具。"""
-    task: str = Field(..., description="用户的原始问题")

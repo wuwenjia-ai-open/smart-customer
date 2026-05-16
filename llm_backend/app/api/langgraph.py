@@ -1,18 +1,15 @@
-"""LangGraph Agent 查询路由"""
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+"""LangGraph Agent 查询路由 — 支持流式输出"""
+from fastapi import APIRouter, HTTPException, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
-from pathlib import Path
-from datetime import datetime
-import os
 import json
 
 from app.core.logger import get_logger
 from app.core.config import settings
 from app.lg_agent.lg_states import InputState
 from app.lg_agent.utils import new_uuid
-from app.lg_agent.lg_builder import supervisor_graph as graph
+from app.lg_agent.lg_builder import get_graph
 from langgraph.types import Command
 
 router = APIRouter()
@@ -30,23 +27,9 @@ async def langgraph_query(
     query: str = Form(...),
     user_id: int = Form(...),
     conversation_id: Optional[str] = Form(None),
-    image: Optional[UploadFile] = File(None),
 ):
     try:
         logger.info(f"LangGraph query user={user_id} conv={conversation_id}")
-
-        image_path = None
-        if image:
-            image_dir = Path("uploads/images")
-            image_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            original_name, ext = os.path.splitext(image.filename)
-            new_filename = f"{original_name}_{timestamp}{ext}"
-            image_path = image_dir / new_filename
-            content = await image.read()
-            with open(image_path, "wb") as f:
-                f.write(content)
-            logger.info(f"Saved image {new_filename} for user {user_id}")
 
         is_new = not conversation_id
         thread_id = conversation_id if conversation_id else new_uuid()
@@ -54,12 +37,11 @@ async def langgraph_query(
             "configurable": {
                 "thread_id": thread_id,
                 "user_id": user_id,
-                "image_path": str(image_path) if image_path else None,
             }
         }
 
         async def process_stream():
-            # 新会话同步到 MySQL（不影响 Agent 流程）
+            # 新会话同步到 MySQL
             if is_new:
                 try:
                     from app.services.conversation_service import ConversationService
@@ -67,26 +49,54 @@ async def langgraph_query(
                         user_id=user_id, title=query[:30], thread_id=thread_id
                     )
                 except Exception:
-                    logger.warning(f"Failed to create conversation record for thread {thread_id}, proceeding without persistence")
-            yield f"data: {json.dumps({'status': 'thinking', 'msg': '对方正在输入...'})}\n\n"
+                    logger.warning(
+                        f"Failed to create conversation record for thread {thread_id}, "
+                        "proceeding without persistence"
+                    )
+
+            yield f"data: {json.dumps({'status': 'thinking', 'msg': '正在分析您的问题...'})}\n\n"
+
             try:
                 stream_input = InputState(messages=query)
-                result = await graph.ainvoke(stream_input, thread_config)
-                # 优先取 messages，其次取 answer
-                answer = ""
-                msgs = result.get("messages", [])
-                if msgs:
-                    last = msgs[-1]
-                    content = getattr(last, "content", None) or (last.get("content") if isinstance(last, dict) else None)
-                    if content:
-                        answer = str(content)
-                if not answer:
-                    answer = str(result.get("answer", "") or result.get("summary", ""))
-                if answer:
-                    for i in range(0, len(answer), 32):
-                        yield f"data: {json.dumps(answer[i:i+32], ensure_ascii=False)}\n\n"
-                    return
-                yield f"data: {json.dumps('抱歉，我暂时无法回答这个问题，请稍后再试或换个问法～')}\n\n"
+                graph = await get_graph()
+
+                last_status = None
+                inside_final_node = False  # 是否在 merge_results / respond 内部
+                async for event in graph.astream_events(stream_input, thread_config, version="v2"):
+                    kind = event.get("event", "")
+                    node_name = event.get("name", "")
+
+                    # 追踪当前链
+                    if kind == "on_chain_start":
+                        status_map = {
+                            "classify_intent": "正在理解您的问题...",
+                            "decompose_tasks": "正在分析任务...",
+                            "dispatch_workers": "正在分发任务给专家...",
+                            "product_qa": "正在查询商品信息...",
+                            "order_qa": "正在查询订单信息...",
+                            "after_sales": "正在处理售后请求...",
+                            "general_chat": "正在准备回复...",
+                            "merge_results": "正在整理回答...",
+                        }
+                        status_msg = status_map.get(node_name)
+                        if status_msg and status_msg != last_status:
+                            last_status = status_msg
+                            yield f"data: {json.dumps({'status': 'progress', 'msg': status_msg})}\n\n"
+                        if node_name in ("merge_results", "respond"):
+                            inside_final_node = True
+
+                    elif kind == "on_chain_end":
+                        if node_name in ("merge_results", "respond"):
+                            inside_final_node = False
+
+                    # LLM token 流式输出 — 只推最终回答节点
+                    if kind == "on_chat_model_stream" and inside_final_node:
+                        chunk = event.get("data", {}).get("chunk")
+                        if chunk and hasattr(chunk, "content") and chunk.content:
+                            yield f"data: {json.dumps(chunk.content, ensure_ascii=False)}\n\n"
+
+                yield f"data: {json.dumps({'status': 'done'})}\n\n"
+
             except Exception:
                 logger.exception("Agent error")
                 yield f"data: {json.dumps('系统开小差了，请稍后再试～')}\n\n"
@@ -107,6 +117,7 @@ async def langgraph_resume(request: LangGraphResumeRequest):
         thread_config = {"configurable": {"thread_id": request.conversation_id}}
 
         async def process_resume():
+            graph = await get_graph()
             async for c, metadata in graph.astream(
                 Command(resume=request.query), stream_mode="messages", config=thread_config
             ):

@@ -1,12 +1,13 @@
 """Supervisor 节点实现"""
+import json
 import logging
 import uuid
-from typing import Any, Dict, List
+from typing import Any, AsyncIterator, Dict, List
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.prompts import ChatPromptTemplate
-from langgraph.types import Send
+from langgraph.types import Command, Send
 
 from app.lg_agent.supervisor.state import SupervisorState, SubTask, WorkerResult
 from app.lg_agent.prompts.supervisor.classify import CLASSIFY_SYSTEM_PROMPT, ClassifyOutput
@@ -14,6 +15,8 @@ from app.lg_agent.prompts.supervisor.decompose import DECOMPOSE_SYSTEM_PROMPT, D
 from app.lg_agent.prompts.supervisor.merge import MERGE_SYSTEM_PROMPT
 
 _log = logging.getLogger(__name__)
+
+MAX_REROUTE = 2  # 重路由上限
 
 
 def make_classify_node(llm: BaseChatModel):
@@ -49,6 +52,7 @@ def make_classify_node(llm: BaseChatModel):
                     priority=1,
                 )],
                 "next_action": "dispatch",
+                "reroute_count": 0,
             }
 
         if result.intent == "multi":
@@ -56,6 +60,7 @@ def make_classify_node(llm: BaseChatModel):
                 "intent": "multi",
                 "workers": result.workers,
                 "next_action": "decompose",
+                "reroute_count": 0,
             }
 
         # Single worker
@@ -71,6 +76,7 @@ def make_classify_node(llm: BaseChatModel):
                 priority=1,
             )],
             "next_action": "dispatch",
+            "reroute_count": 0,
         }
 
     return classify_intent
@@ -102,14 +108,14 @@ def make_decompose_node(llm: BaseChatModel):
                 priority=t.priority,
             ))
 
-        _log.info(f"Decompose: {len(sub_tasks)} sub-tasks")
+        _log.info(f"Decompose: {len(sub_tasks)} sub-tasks -> {[t['worker_type'] for t in sub_tasks]}")
         return {"sub_tasks": sub_tasks, "next_action": "dispatch"}
 
     return decompose_tasks
 
 
-def dispatch_workers(state: SupervisorState, *, config) -> List[Send]:
-    """使用 Send() 并行分发子任务到各 Worker 子图"""
+def dispatch_workers(state: SupervisorState) -> Command:
+    """使用 Command(goto=[Send]) 并行分发子任务到各 Worker 子图"""
     sub_tasks = state.get("sub_tasks", [])
     msgs = state.get("messages", [])
 
@@ -122,6 +128,7 @@ def dispatch_workers(state: SupervisorState, *, config) -> List[Send]:
             "context": task.get("context", {}),
             "iteration_count": 0,
             "next_action": "think",
+            "tool_to_execute": "",
             "tool_call_history": [],
             "final_answer": "",
             "status": "",
@@ -130,7 +137,7 @@ def dispatch_workers(state: SupervisorState, *, config) -> List[Send]:
         sends.append(Send(task["worker_type"], worker_state))
 
     _log.info(f"Dispatch: {len(sends)} workers -> {[s.node for s in sends]}")
-    return sends
+    return Command(goto=sends)
 
 
 def make_merge_node(llm: BaseChatModel):
@@ -141,10 +148,35 @@ def make_merge_node(llm: BaseChatModel):
 
     async def merge_results(state: SupervisorState, *, config) -> Dict[str, Any]:
         results = state.get("worker_results", [])
+        reroute_count = state.get("reroute_count", 0)
+
         if not results:
             return {"final_answer": "抱歉，处理过程中出现了问题，请稍后再试。", "next_action": "respond"}
 
-        # Check for clarifications
+        # 检查 reroute：Worker 判断分错类，建议转给其他 Worker
+        for r in results:
+            if r.get("control_action") == "reroute" and r.get("reroute_to"):
+                if reroute_count < MAX_REROUTE:
+                    target = r["reroute_to"]
+                    _log.info(f"Reroute: {r['worker_type']} -> {target} (count={reroute_count + 1})")
+                    msgs = state.get("messages", [])
+                    query = msgs[-1].content if msgs and hasattr(msgs[-1], "content") else str(msgs[-1])
+                    return {
+                        "workers": [target],
+                        "reroute_count": reroute_count + 1,
+                        "sub_tasks": [SubTask(
+                            task_id=str(uuid.uuid4()),
+                            worker_type=target,
+                            description=query,
+                            context={"reroute_reason": r.get("answer", "")},
+                            priority=1,
+                        )],
+                        "next_action": "dispatch",
+                    }
+                else:
+                    _log.warning(f"Max reroute exceeded, responding with current results")
+
+        # 检查澄清
         for r in results:
             if r.get("status") == "clarification_needed":
                 return {
@@ -153,21 +185,41 @@ def make_merge_node(llm: BaseChatModel):
                     "next_action": "clarify",
                 }
 
+        # 单结果快速通道：高置信 + 无兜底话术 + 长度合理 → 直接透传
         if len(results) == 1:
-            return {
-                "final_answer": results[0].get("answer", ""),
-                "next_action": "respond",
-            }
+            r = results[0]
+            confidence = r.get("confidence", 0.5)
+            answer = r.get("answer", "")
 
-        # Multiple results: merge via LLM
+            # 规则门禁：检测兜底/失败话术
+            _low_quality_markers = [
+                "抱歉，我暂时无法",
+                "无法处理这个问题",
+                "系统开小差",
+            ]
+            is_fallback = any(m in answer for m in _low_quality_markers)
+            is_too_short = len(answer.strip()) < 20
+
+            if confidence >= 0.7 and not is_fallback and not is_too_short:
+                return {"final_answer": answer, "next_action": "respond"}
+
+            # 不满足快速通道 → 走 LLM 合成做二次加工
+            _log.info(
+                f"Single result gate failed: confidence={confidence} "
+                f"fallback={is_fallback} short={is_too_short} — routing to LLM merge"
+            )
+
+        # LLM 合成（多结果 或 不满足快速通道的单结果）：按置信度排序合并
+        sorted_results = sorted(results, key=lambda x: x.get("confidence", 0), reverse=True)
+
         msgs = state.get("messages", [])
         context = "\n".join(
             str(m.content)[:200] for m in msgs[-4:]
         ) if msgs else "无"
 
         results_text = "\n---\n".join(
-            f"[{r.get('worker_type', 'unknown')}] {r.get('answer', '')}"
-            for r in results
+            f"[{r.get('worker_type', 'unknown')}] (置信度: {r.get('confidence', 0):.0%})\n{r.get('answer', '')}"
+            for r in sorted_results
         )
 
         response = await (merge_prompt | llm).ainvoke({
@@ -181,6 +233,20 @@ def make_merge_node(llm: BaseChatModel):
     return merge_results
 
 
-async def respond_node(state: SupervisorState, *, config) -> Dict[str, Any]:
+def make_respond_node(llm: BaseChatModel = None):
+    """生成最终回复节点 — 支持流式输出"""
+
+    async def respond_node(state: SupervisorState, *, config) -> Dict[str, Any]:
+        answer = state.get("final_answer", "抱歉，我暂时无法回答这个问题。")
+        return {"messages": [AIMessage(content=answer)]}
+
+    return respond_node
+
+
+async def respond_node_stream(state: SupervisorState, *, config) -> AsyncIterator[Dict[str, Any]]:
+    """流式版 respond_node — yield AIMessageChunk"""
     answer = state.get("final_answer", "抱歉，我暂时无法回答这个问题。")
-    return {"messages": [AIMessage(content=answer)]}
+    # 按 8 字符块输出，模拟 token 级流式
+    for i in range(0, len(answer), 8):
+        chunk = answer[i:i + 8]
+        yield {"messages": [AIMessageChunk(content=chunk)]}

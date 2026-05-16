@@ -15,4 +15,6 @@ def get_neo4j_graph() -> Neo4jGraph:
         username=settings.NEO4J_USERNAME,
         password=settings.NEO4J_PASSWORD,
         database=settings.NEO4J_DATABASE,
+        refresh_schema=False,
+        sanitize=True,
     )
