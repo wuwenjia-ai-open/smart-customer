@@ -6,9 +6,9 @@ import re
 from operator import add
 from typing import Annotated, Any, Dict, List, Optional
 
-from langchain.agents import create_agent
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import StateGraph, START, END, add_messages
+from langgraph.prebuilt import create_react_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
 from typing_extensions import TypedDict
@@ -119,13 +119,13 @@ def _fallback(worker_type: str, message: str) -> Dict[str, Any]:
 def build_worker(llm: BaseChatModel, tools: list, system_prompt: str, worker_type: str) -> StateGraph:
     """构建 Worker Agent — create_agent + 结果提取"""
 
-    react_agent = create_agent(
+    react_agent = create_react_agent(
         llm,
         tools,
-        system_prompt=system_prompt,
+        prompt=system_prompt,
     )
 
-    builder = StateGraph(WorkerInternalState, output_schema=WorkerOutputState)
+    builder = StateGraph(WorkerInternalState, output=WorkerOutputState)
 
     async def execute(state: WorkerInternalState) -> Dict[str, Any]:
         _log.info(f"Worker {worker_type}: executing react agent")
