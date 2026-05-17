@@ -160,7 +160,7 @@ class ConversationService:
             raise
 
     @staticmethod
-    async def delete_conversation(conversation_id: int):
+    async def delete_conversation(conversation_id: int, user_id: int):
         """删除会话及其所有消息"""
         try:
             async with AsyncSessionLocal() as db:
@@ -168,9 +168,11 @@ class ConversationService:
                 stmt = select(Conversation).where(Conversation.id == conversation_id)
                 result = await db.execute(stmt)
                 conversation = result.scalar_one_or_none()
-                
+
                 if not conversation:
                     raise ValueError(f"Conversation {conversation_id} not found")
+                if conversation.user_id != user_id:
+                    raise ValueError(f"Permission denied")
                 
                 # 删除会话(会自动级联删除相关消息)
                 await db.delete(conversation)

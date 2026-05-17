@@ -49,11 +49,13 @@ async def get_conversation_messages(conversation_id: int, user_id: int):
 
 
 @router.delete("/conversations/{conversation_id}")
-async def delete_conversation(conversation_id: int):
+async def delete_conversation(conversation_id: int, user_id: int):
     try:
         conversation_service = ConversationService()
-        await conversation_service.delete_conversation(conversation_id)
+        await conversation_service.delete_conversation(conversation_id, user_id)
         return {"message": "会话已删除"}
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
         logger.error(f"删除会话失败: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

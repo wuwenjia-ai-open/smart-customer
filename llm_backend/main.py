@@ -20,7 +20,7 @@ allowed_origins = [o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.s
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_credentials=True,
+    allow_credentials=False if settings.ALLOWED_ORIGINS == "*" else True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -32,7 +32,7 @@ app.include_router(api_router, prefix="/api")
 async def health_check():
     neo4j_ok = False
     try:
-        from app.lg_agent.kg_sub_graph.neo4j_conn import get_neo4j_graph
+        from app.lg_agent.data.neo4j_conn import get_neo4j_graph
         get_neo4j_graph().query("RETURN 1")
         neo4j_ok = True
     except Exception:

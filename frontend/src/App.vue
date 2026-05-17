@@ -1,47 +1,28 @@
-<template>
-  <LoginPage v-if="currentView === 'login'" @loginSuccess="onLoginSuccess" />
-  <template v-else>
-    <AppShell @openChat="showChat = true" />
-    <ChatPage :show="showChat" @close="showChat = false" />
-  </template>
-  <div :class="['toast', { show: toastShow }]">{{ toastMsg }}</div>
-</template>
-
 <script setup>
-import { ref, onMounted } from 'vue'
-import LoginPage from './components/LoginPage.vue'
-import AppShell from './components/AppShell.vue'
-import ChatPage from './components/ChatPage.vue'
-import { useAuth } from './composables/useAuth.js'
+import { useRoute, useRouter } from 'vue-router'
+import { computed } from 'vue'
 
-const { token, api } = useAuth()
+const route = useRoute()
+const router = useRouter()
+const isChat = computed(() => route.name === 'chat')
 
-const currentView = ref('login')
-const showChat = ref(false)
-const toastMsg = ref('')
-const toastShow = ref(false)
-
-function showToast(msg) {
-  toastMsg.value = msg
-  toastShow.value = true
-  setTimeout(() => { toastShow.value = false }, 3000)
+function toggleView() {
+  router.push(isChat.value ? '/' : '/chat')
 }
-
-async function onLoginSuccess() {
-  currentView.value = 'app'
-}
-
-async function checkToken() {
-  if (!token.value) return
-  try {
-    await api('GET', '/api/validate-token')
-    currentView.value = 'app'
-  } catch {
-    token.value = ''
-    localStorage.removeItem('token')
-    localStorage.removeItem('user')
-  }
-}
-
-onMounted(() => checkToken())
 </script>
+
+<template>
+  <div class="relative min-h-screen bg-[#050508]">
+    <div class="relative z-10">
+      <button
+        @click="toggleView"
+        class="fixed top-5 left-5 z-50 flex items-center gap-1.5 rounded-full border border-white/[0.08] bg-white/[0.03] backdrop-blur-xl px-3.5 py-2 text-sm text-neutral-300 transition-all hover:bg-white/[0.08] hover:border-white/[0.16] hover:text-white hover:shadow-[0_0_25px_rgba(108,92,231,0.25)] active:scale-95"
+      >
+        <span class="text-base">{{ isChat ? '🛍️' : '💬' }}</span>
+        <span>{{ isChat ? '商城' : '客服' }}</span>
+      </button>
+
+      <router-view />
+    </div>
+  </div>
+</template>
