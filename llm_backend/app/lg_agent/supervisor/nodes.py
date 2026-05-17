@@ -183,6 +183,7 @@ def make_merge_node(llm: BaseChatModel):
                     "pending_clarification": r.get("clarification_question", ""),
                     "needs_clarification": True,
                     "next_action": "clarify",
+                    "worker_results": [],
                 }
 
         # 单结果快速通道：高置信 + 无兜底话术 + 长度合理 → 直接透传
@@ -201,7 +202,7 @@ def make_merge_node(llm: BaseChatModel):
             is_too_short = len(answer.strip()) < 20
 
             if confidence >= 0.7 and not is_fallback and not is_too_short:
-                return {"final_answer": answer, "next_action": "respond"}
+                return {"final_answer": answer, "next_action": "respond", "worker_results": []}
 
             # 不满足快速通道 → 走 LLM 合成做二次加工
             _log.info(
@@ -228,7 +229,7 @@ def make_merge_node(llm: BaseChatModel):
         })
 
         answer = response.content if hasattr(response, "content") else str(response)
-        return {"final_answer": answer, "next_action": "respond"}
+        return {"final_answer": answer, "next_action": "respond", "worker_results": []}
 
     return merge_results
 

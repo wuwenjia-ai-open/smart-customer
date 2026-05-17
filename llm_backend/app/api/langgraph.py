@@ -62,6 +62,7 @@ async def langgraph_query(
 
                 last_status = None
                 inside_final_node = False  # 是否在 merge_results / respond 内部
+                chunks_emitted = False  # 是否已经流式输出过文本（用于快速通道兜底判断）
                 async for event in graph.astream_events(stream_input, thread_config, version="v2"):
                     kind = event.get("event", "")
                     node_name = event.get("name", "")
@@ -86,13 +87,28 @@ async def langgraph_query(
                             inside_final_node = True
 
                     elif kind == "on_chain_end":
-                        if node_name in ("merge_results", "respond"):
+                        if node_name == "merge_results":
                             inside_final_node = False
+                        elif node_name == "respond":
+                            inside_final_node = False
+                            # 单结果快速通道：merge_results 直接给出 final_answer，
+                            # respond_node 只是封装为 AIMessage，没有 LLM 调用，
+                            # 因此前面没有任何 on_chat_model_stream 事件。
+                            # 在 respond 结束时兜底把答案切片推给前端。
+                            if not chunks_emitted:
+                                output = event.get("data", {}).get("output") or {}
+                                msgs = output.get("messages") if isinstance(output, dict) else None
+                                if msgs:
+                                    content = getattr(msgs[-1], "content", "") or ""
+                                    if content:
+                                        for i in range(0, len(content), 8):
+                                            yield f"data: {json.dumps(content[i:i+8], ensure_ascii=False)}\n\n"
 
                     # LLM token 流式输出 — 只推最终回答节点
                     if kind == "on_chat_model_stream" and inside_final_node:
                         chunk = event.get("data", {}).get("chunk")
                         if chunk and hasattr(chunk, "content") and chunk.content:
+                            chunks_emitted = True
                             yield f"data: {json.dumps(chunk.content, ensure_ascii=False)}\n\n"
 
                 yield f"data: {json.dumps({'status': 'done'})}\n\n"
