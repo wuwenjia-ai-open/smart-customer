@@ -221,7 +221,6 @@ customer/
 ├── docker-compose.yml                 MySQL :3307 / Neo4j :7474+7687 / Milvus :19530
 ├── docs/
 │   └── memory-system-v2-recap.md      记忆系统 v2-lite 重构总结
-├── CLAUDE.md                          项目约定 + 不变量 (Claude Code 优先读这里)
 └── README.md                          本文件
 ```
 
