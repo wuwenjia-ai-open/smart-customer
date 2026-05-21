@@ -152,8 +152,6 @@ classify_intent 读上下文时分组:
   [对话摘要]    "上一段聊了什么"
 ```
 
-完整设计见 [`docs/memory-system-v2-recap.md`](docs/memory-system-v2-recap.md)。
-
 ### 5. SSE 流式 + 会话自愈
 
 - 后端 `POST /api/langgraph/query` 用 SSE 推三类事件:`status`(阶段提示)、`data`(token)、`end`(收尾)
@@ -327,6 +325,4 @@ product_qa_tools = [
 ## 📄 License
 
 [MIT License](./LICENSE) — 自由使用、修改、分发,保留版权声明即可。
-
----
 
