@@ -140,7 +140,9 @@ class ProductService:
         return records
 
     def _enrich_with_details(self, names: List[str]) -> List[Dict]:
-        """批量从 Neo4j 补全产品详情"""
+        """批量从 Neo4j 补全产品详情 — 规范化键名为 product_name 等,
+        与 Milvus 侧字段保持一致,避免上游访问时 KeyError。
+        """
         if not names:
             return []
         rows = self._neo4j.query(
@@ -150,7 +152,17 @@ class ProductService:
             "d.KeyFeatures, d.Specifications",
             params={"names": names},
         )
-        return list(rows) if rows else []
+        normalized = []
+        for row in rows or []:
+            normalized.append({
+                "product_name":   row.get("p.ProductName", ""),
+                "price":          row.get("p.UnitPrice", ""),
+                "category":       row.get("p.CategoryName", ""),
+                "brand":          row.get("p.BrandName", ""),
+                "key_features":   row.get("d.KeyFeatures", ""),
+                "specifications": row.get("d.Specifications", ""),
+            })
+        return normalized
 
 
 class OrderService:
@@ -160,12 +172,12 @@ class OrderService:
         self._neo4j = neo4j_graph
 
     def get_order(self, order_id: int) -> Optional[Dict]:
-        """查询订单 + 商品明细"""
+        """查询订单 + 商品明细 — 字段与 scripts/seed_electronics.py 保持一致"""
         rows = self._neo4j.query(
             "MATCH (o:Order) WHERE o.orderId = $order_id "
             "OPTIONAL MATCH (o)-[c:CONTAINS]->(p:Product) "
-            "RETURN o.orderId, o.OrderDate, o.RequiredDate, o.ShippedDate, "
-            "o.ShipVia, o.ShipName, o.ShipAddress, o.ShipCity, o.ShipCountry, o.Freight, "
+            "RETURN o.orderId, o.OrderDate, o.ShippedDate, o.CustomerName, "
+            "o.ShipName, o.ShipAddress, o.ShipCity, o.ShipCountry, o.Freight, "
             "collect({product: p.ProductName, qty: c.Quantity, unitPrice: c.UnitPrice}) as items",
             params={"order_id": order_id},
         )

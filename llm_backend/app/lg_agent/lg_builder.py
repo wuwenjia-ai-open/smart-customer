@@ -1,10 +1,9 @@
 """Multi-Agent Supervisor Graph — 替代原单 Agent Pipeline"""
 import asyncio
-import logging
 
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
+from loguru import logger as _log
 
 from app.core.config import settings
 from app.services.llm_factory import LLMFactory
@@ -17,8 +16,6 @@ from app.lg_agent.supervisor.nodes import (
 )
 from app.lg_agent.workers import product_qa, order_qa, after_sales, general_chat
 from app.lg_agent.workers.tools.registry import register_tool
-
-_log = logging.getLogger(__name__)
 
 
 def _create_embedding_model():
@@ -88,23 +85,46 @@ def _init_tool_registry():
 
 
 def build_supervisor_graph() -> StateGraph:
-    """构建 Supervisor + Workers 超级图"""
+    """构建 Supervisor + Workers 超级图 — 三档 LLM 分层路由
+
+    按【任务能力维度】分配模型，不是任意安排：
+
+    flash  (DeepSeek V4-Flash)
+      ▸ 中文母语理解强 + 单次成本 < ¥0.0001 (cache hit)
+      ▸ 用于：分类 / 拆解 / 合成 / 闲聊 (无工具或弱工具场景)
+
+    tool   (GPT-5.4 Mini)
+      ▸ function calling 稳定性最强，多步 ReAct loop 不幻觉参数
+      ▸ 用于：product_qa (多步链式 RAG) + order_qa (Neo4j 查询)
+
+    reason (GPT-5.5)
+      ▸ 旗舰推理 + 同理心，处理复杂决策
+      ▸ 用于：after_sales (退换货政策判断 + 客户情绪响应)
+    """
     _init_tool_registry()
 
-    llm = LLMFactory.create_agent_llm()
+    flash_llm  = LLMFactory.create_llm("flash")
+    tool_llm   = LLMFactory.create_llm("tool")
+    reason_llm = LLMFactory.create_llm("reason")
 
     builder = StateGraph(SupervisorState)
 
     # ── Supervisor nodes ──
-    builder.add_node("classify_intent", make_classify_node(llm))
-    builder.add_node("decompose_tasks", make_decompose_node(llm))
-    builder.add_node("merge_results", make_merge_node(llm))
-    builder.add_node("respond", make_respond_node())
+    builder.add_node("classify_intent", make_classify_node(flash_llm))
+    builder.add_node("decompose_tasks", make_decompose_node(flash_llm))
+    builder.add_node("merge_results",   make_merge_node(flash_llm))
+    builder.add_node("respond",         make_respond_node())
 
-    # ── Worker sub-graphs ──
+    # ── Worker sub-graphs — 工具调用密集型 (product_qa/order_qa) 统一用 GPT-5.4 Mini ──
+    _worker_llm_map = {
+        "product_qa":   tool_llm,    # 多步链式 RAG (Milvus + Neo4j)，function calling 稳定性优先
+        "order_qa":     tool_llm,    # Neo4j 订单查询，function calling 稳定性优先
+        "after_sales":  reason_llm,  # 政策推理 + 情感响应，GPT-5.5 旗舰
+        "general_chat": flash_llm,   # 闲聊，Flash 够用
+    }
     for worker in [product_qa, order_qa, after_sales, general_chat]:
-        worker_graph = worker.build(llm)
         worker_type = worker.__name__.split(".")[-1]
+        worker_graph = worker.build(_worker_llm_map[worker_type])
         builder.add_node(worker_type, worker_graph)
 
     # ── Edges ──
@@ -115,13 +135,25 @@ def build_supervisor_graph() -> StateGraph:
         builder.add_edge(worker_type, "merge_results")
 
     def _build_sends(state: SupervisorState) -> list:
-        """构建 Send 列表 — 用于 conditional edge 的 dispatch"""
+        """构建 Send 列表 — 用于 conditional edge 的 dispatch
+
+        Worker 只接收当前 sub_task 的 description 作为单条 HumanMessage，
+        不带历史对话——避免 ReAct agent 看到上轮 AIMessage 复用其内容。
+        多轮上下文由 supervisor 在 classify/decompose 时打包进 description。
+        """
+        from langchain_core.messages import HumanMessage
+
         sub_tasks = state.get("sub_tasks", [])
-        msgs = state.get("messages", [])
+        _log.info(
+            f"_build_sends: {len(sub_tasks)} sub_tasks "
+            f"{[(t.get('worker_type'), (t.get('description', '') or '')[:30]) for t in sub_tasks]}, "
+            f"existing worker_results={len(state.get('worker_results', []))}, "
+            f"reroute_count={state.get('reroute_count', 0)}"
+        )
         sends = []
         for task in sub_tasks:
             sends.append(Send(task["worker_type"], {
-                "messages": list(msgs),
+                "messages": [HumanMessage(content=task["description"])],
                 "worker_type": task["worker_type"],
                 "task": task["description"],
                 "context": task.get("context", {}),
@@ -170,14 +202,7 @@ def build_supervisor_graph() -> StateGraph:
         "respond": "respond",
     })
     builder.add_edge("respond", END)
-
-    # ── Checkpointer (SQLite 持久化) ──
-    async def _create_checkpointer():
-        import aiosqlite
-        conn = await aiosqlite.connect(settings.CHECKPOINT_DB_PATH)
-        return AsyncSqliteSaver(conn)
-
-    return builder, _create_checkpointer
+    return builder
 
 
 # ── Lazy graph instance ──
@@ -187,8 +212,7 @@ _graph_instance = None
 async def get_graph():
     global _graph_instance
     if _graph_instance is None:
-        builder, checkpointer_factory = build_supervisor_graph()
-        checkpointer = await checkpointer_factory()
-        _graph_instance = builder.compile(checkpointer=checkpointer)
-        _log.info("Supervisor graph compiled successfully")
+        builder = build_supervisor_graph()
+        _graph_instance = builder.compile()
+        _log.info("Supervisor graph compiled (no checkpointer — memory via MemoryService)")
     return _graph_instance

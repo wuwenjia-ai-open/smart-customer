@@ -1,7 +1,7 @@
+import os
+
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from pathlib import Path
 
 from app.core.logger import get_logger
 from app.core.middleware import LoggingMiddleware
@@ -13,6 +13,17 @@ from app.models.user import User
 logger = get_logger(service="main")
 
 app = FastAPI(title="灵犀智购 REST API")
+
+
+@app.on_event("startup")
+async def setup_observability():
+    if settings.LANGCHAIN_TRACING_V2 and settings.LANGCHAIN_API_KEY:
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_API_KEY"] = settings.LANGCHAIN_API_KEY
+        os.environ["LANGCHAIN_PROJECT"] = settings.LANGCHAIN_PROJECT
+        logger.info(f"LangSmith tracing enabled → project={settings.LANGCHAIN_PROJECT}")
+    else:
+        logger.info("LangSmith tracing disabled — set LANGCHAIN_TRACING_V2=true + LANGCHAIN_API_KEY to enable")
 
 app.add_middleware(LoggingMiddleware)
 
@@ -62,6 +73,3 @@ async def validate_token(current_user: User = Depends(get_current_user)):
         },
     }
 
-
-STATIC_DIR = Path(__file__).parent / "static" / "dist"
-app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")

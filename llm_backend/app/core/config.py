@@ -6,10 +6,16 @@ ROOT_DIR = Path(__file__).parent.parent.parent
 ENV_FILE = ROOT_DIR / ".env"
 
 class Settings(BaseSettings):
-    # Deepseek settings
+    # DeepSeek — 主力 (V4-Flash)
     DEEPSEEK_API_KEY: str
     DEEPSEEK_BASE_URL: str
-    DEEPSEEK_MODEL: str
+    DEEPSEEK_MODEL: str = "deepseek-chat"
+
+    # GPT via aihubmix — 工具调用 (order_qa) + 推理 (after_sales)
+    GPT_API_KEY: str = ""
+    GPT_BASE_URL: str = "https://aihubmix.com/v1"
+    GPT_TOOL_MODEL: str = "gpt-5.4-mini"
+    GPT_REASON_MODEL: str = "gpt-5.5"
 
     # Vision Model settings
     VISION_API_KEY: str
@@ -51,8 +57,10 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "bge-m3"
     EMBEDDING_THRESHOLD: float = 0.90
 
-    # SQLite checkpoint
-    CHECKPOINT_DB_PATH: str = "checkpoints.db"
+    # LangSmith — 可观测性（可选，不设置则不追踪）
+    LANGCHAIN_TRACING_V2: bool = False
+    LANGCHAIN_API_KEY: str = ""
+    LANGCHAIN_PROJECT: str = "lingxi-smart-shopping"
 
     @property
     def DATABASE_URL(self) -> str:

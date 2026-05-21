@@ -1,17 +1,18 @@
 """工具注册表 — 工具名到执行器的映射"""
 import json
-from typing import Any, Dict, Protocol, runtime_checkable
+from typing import Any, Dict, Optional, Protocol, runtime_checkable
 
 
 class ToolResult:
     """工具执行结果"""
     def __init__(self, records: list = None, summary: str = "", error: str = "",
-                 success: bool = True, control: dict = None):
+                 success: bool = True, control: dict = None, slots: Optional[dict] = None):
         self.records = records or []
         self.summary = summary
         self.error = error
         self.success = success
         self.control = control  # {"action": "clarify"|"escalate"|"reroute", ...}
+        self.slots = slots  # 回传给 Supervisor 累积到 dialogue_states
 
     def to_dict(self) -> dict:
         d = {"records": self.records, "summary": self.summary, "success": self.success}
@@ -19,6 +20,8 @@ class ToolResult:
             d["error"] = self.error
         if self.control:
             d["control"] = self.control
+        if self.slots:
+            d["slots"] = self.slots
         return d
 
 

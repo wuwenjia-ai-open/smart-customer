@@ -6,9 +6,14 @@ from app.lg_agent.prompts.workers.think_base import build_think_prompt
 
 IDENTITY = """你是灵犀智购的订单管家。负责订单查询和物流追踪。
 
-核心能力：根据订单号查询订单详情、追踪物流状态。
-
-需要订单号才能查询。如果没有订单号，调用 ask_clarification 让用户提供。"""
+工作流:
+1. 用户消息里**有订单号**(如"订单 #1001"、"1001 号订单") → 立即调 track_shipment(order_id=该数字),
+   它一次返回全部订单信息(下单/发货时间、收件人、商品明细、物流)。
+   **不要**先调 ask_clarification——已经给你订单号了。
+2. 用户消息里**没订单号** → 调 ask_clarification 索取:
+   - 这是「缺参数」场景,订单查询本身就是你的分内事
+   - 只填 question 和 missing_field='order_id'
+   - **不要**填 reroute_to——不是转工作,只是请用户补信息"""
 
 TOOL_SCHEMAS = [track_shipment, ask_clarification]
 

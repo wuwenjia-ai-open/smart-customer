@@ -1,224 +1,231 @@
 # 灵犀智购 — 智能客服系统
 
-基于 **LangGraph + Neo4j + DeepSeek** 构建的智能电商客服系统，面向智能家居消费电子场景。用户登录后通过对话式 AI 客服查询产品、订单、物流、售后政策，Agent 内部通过"路由 → 守卫 → 规划 → 工具选择 → 查询执行 → 结果汇总 → 幻觉检测"的完整链路，自动从知识图谱检索数据并生成自然语言回复。
+基于 **LangGraph Multi-Agent + DeepSeek + GPT** 构建的智能电商客服系统，面向消费电子场景。Supervisor 节点先做意图分类，再把任务派发给 4 个并行的 ReAct Worker（产品咨询 / 订单查询 / 售后处理 / 闲聊），每个 Worker 在自己的工具集里循环推理，最终由 Supervisor 合成回复。前后端通过 SSE 流式输出 + JWT 登录 + 分段式记忆持久化。
+
+> **当前分支**: `feat/multi-agent`
+> 本文档对应已重构后的 Supervisor + Worker 多 Agent 架构。如果你之前看过单图 + 子图版本（Router → Guardrails → Planner → Cypher），那是 pre-refactor 设计，已废弃。
+
+---
 
 ## 目录
 
-- [系统架构](#系统架构)
+- [架构总览](#架构总览)
+- [核心特性](#核心特性)
 - [技术栈](#技术栈)
 - [项目结构](#项目结构)
 - [快速开始](#快速开始)
 - [配置参考](#配置参考)
+- [关键模块详解](#关键模块详解)
+  - [Supervisor + 4 Worker](#supervisor--4-worker)
+  - [三档 LLM 路由](#三档-llm-路由)
+  - [DataService 数据层](#dataservice-数据层)
+  - [工具注册表](#工具注册表)
+  - [记忆系统 v2-lite](#记忆系统-v2-lite)
+  - [登录与会话恢复](#登录与会话恢复)
 - [API 文档](#api-文档)
-- [Agent 工作流详解](#agent-工作流详解)
-- [预定义 Cypher 查询](#预定义-cypher-查询)
-- [查询匹配策略](#查询匹配策略)
 - [数据库迁移](#数据库迁移)
+- [项目不变量（看代码前先读这里）](#项目不变量看代码前先读这里)
 - [常见问题](#常见问题)
 - [License](#license)
 
-## 系统架构
+---
+
+## 架构总览
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          前端 (Vue 3 + Vite)                         │
-│  LoginPage → ChatPage → ChatMessage                                 │
-│  SSE 流式接收  |  FormData 提交 (文字 + 图片)                         │
-└────────────────────────────┬─────────────────────────────────────────┘
-                             │ POST /api/langgraph/query (SSE)
-                             ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                      后端 (FastAPI + Uvicorn)                        │
-│                                                                      │
-│  ┌──────────────────────────────────────────────────────────────┐   │
-│  │              LangGraph Agent (主图 + 子图)                     │   │
-│  │                                                               │   │
-│  │  用户问题                                                     │   │
-│  │     │                                                        │   │
-│  │     ▼                                                        │   │
-│  │  ┌─────────┐    general-query ──→ respond_to_general_query    │   │
-│  │  │ Router  │─── additional-query → Guardrails → get_additional│   │
-│  │  │ (LLM)   │─── graphrag-query ──→ create_research_plan      │   │
-│  │  └─────────┘─── image-query ────→ create_image_query          │   │
-│  │                                    │                          │   │
-│  │                                    ▼                          │   │
-│  │  ┌──────────────────────────────────────────────────────┐    │   │
-│  │  │  子图 (multi_tool_workflow)                           │    │   │
-│  │  │                                                       │    │   │
-│  │  │  Planner ──→ Tool Selection ──→ Query Execution       │    │   │
-│  │  │  (LLM)        (LLM)              │                    │    │   │
-│  │  │                                  ├─ predefined_cypher │    │   │
-│  │  │                                  │   (60条, 关键词+向量)│   │   │
-│  │  │                                  └─ cypher_query      │    │   │
-│  │  │                                     (LLM 动态生成)     │    │   │
-│  │  │                                          │            │    │   │
-│  │  │                                          ▼            │    │   │
-│  │  │  Summarize ──→ Hallucination Check ──→ answer         │    │   │
-│  │  │  (LLM)          (LLM)                                  │    │   │
-│  │  └──────────────────────────────────────────────────────┘    │   │
-│  └──────────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────────┘
-         │              │              │               │
-         ▼              ▼              ▼               ▼
-    ┌─────────┐   ┌─────────┐   ┌─────────┐    ┌──────────┐
-    │ DeepSeek│   │ Neo4j   │   │ Milvus  │    │  MySQL   │
-    │  (LLM)  │   │ (图数据) │   │ (向量)  │    │ (账户/会话)│
-    └─────────┘   └─────────┘   └─────────┘    └──────────┘
-                                            │
-                                     ┌──────┴──────┐
-                                     │    Ollama   │
-                                     │  (bge-m3)   │
-                                     └─────────────┘
+┌──────────────────────── 前端 (Vue 3 + Vite + Tailwind v4) ────────────────────────┐
+│  Login.vue → Shop.vue / Chat.vue                                                  │
+│  composables: useAuth (JWT) · useChat (SSE)                                       │
+│  beforeEach 守卫:未登录 → /login                                                  │
+└──────────────────────────────────────┬───────────────────────────────────────────┘
+                                       │ POST /api/langgraph/query  (SSE)
+                                       │ Authorization: Bearer <JWT>
+                                       │ X-Conversation-ID: <thread_id>
+                                       ▼
+┌────────────────────── 后端 (FastAPI + Uvicorn :8000) ─────────────────────────────┐
+│                                                                                   │
+│  ┌─── LangGraph Multi-Agent (lg_builder.build_supervisor_graph) ──────────────┐  │
+│  │                                                                            │  │
+│  │   classify_intent  ─multi?─→  decompose_tasks  ─Send─→  Workers (并行)     │  │
+│  │   (flash)                     (flash)                   │                  │  │
+│  │                                                          ▼                  │  │
+│  │                              respond ◀── merge_results ◀── 4 个 ReAct      │  │
+│  │                              (token   ←   (flash 或    ←    sub-graph      │  │
+│  │                               stream)      fast-path)                       │  │
+│  │                                                                            │  │
+│  │   Workers (每个都是 create_react_agent 包了一层 StateGraph):              │  │
+│  │     product_qa   (tier=tool)   tools: semantic_search/compare/recommend    │  │
+│  │     order_qa     (tier=tool)   tools: track_shipment/order lookup          │  │
+│  │     after_sales  (tier=reason) tools: search_faq/create_ticket/escalate    │  │
+│  │     general_chat (tier=flash)  tools: ask_clarification only               │  │
+│  └────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                   │
+│  Services: LLMFactory (3-tier) · MemoryService (v2-lite) · SegmentManager        │
+│  Data    : ProductService · OrderService · PolicyService → Neo4j + Milvus        │
+└───────────────────────────────────────────────────────────────────────────────────┘
+       │                │                  │                    │
+       ▼                ▼                  ▼                    ▼
+  ┌─────────┐    ┌──────────┐       ┌──────────┐         ┌──────────┐
+  │ DeepSeek│    │   GPT    │       │  Neo4j   │         │  MySQL   │
+  │  flash  │    │ tool/    │       │ (产品/订单 │         │ (用户/会话 │
+  │         │    │ reason   │       │  FAQ 图谱)│         │ /消息/槽位)│
+  └─────────┘    └──────────┘       └──────────┘         └──────────┘
+                                          │
+                                    ┌─────┴─────┐
+                                    │  Milvus   │
+                                    │ (产品向量) │
+                                    └───────────┘
+                                          │
+                                    ┌─────┴─────┐
+                                    │  Ollama   │
+                                    │ (bge-m3)  │
+                                    └───────────┘
 ```
+
+---
+
+## 核心特性
+
+- **多 Agent 并行**: Supervisor 把多意图任务通过 `Send` API 并发派发给多个 Worker，单意图直接走单 Worker。
+- **三档 LLM 路由**: `flash`(DeepSeek 主力) / `tool`(GPT-5.4 Mini 工具调用) / `reason`(GPT-5.5 推理共情) 按 Worker 职责分配，平衡成本 / 工具稳定性 / 推理质量。
+- **ReAct + 工具自治**: 每个 Worker 通过 `create_react_agent` 在固定工具集内循环 (`MAX_RECURSION=30`)，能自己决定是否再调一次工具、是否求助、是否升级人工。
+- **结构化控制信号**: 工具返回 `{success, error, control}`，`control.action ∈ {clarify, escalate, reroute}` 反馈给 Supervisor。
+- **分段式记忆**: `(segment_id, worker_type)` 二维隔离槽位，product_qa 和 order_qa 不再互相污染。
+- **会话恢复**: 退出登录后再回来，自动从 `/conversations/latest` 拉历史，连续对话不丢上下文。
+- **SSE 流式 + 自愈**: 后端发现 `conversation_id` 在 DB 里找不到会自动建一条，前端 localStorage 不同步也不会崩。
+
+---
 
 ## 技术栈
 
-| 层级 | 技术 | 版本 | 用途 |
-|------|------|------|------|
-| 前端框架 | Vue 3 | 3.5+ | 电商页面 + 客服聊天界面 |
-| 构建工具 | Vite | 6.x | 前端构建与开发服务器 |
-| 后端框架 | FastAPI | 0.115+ | REST API + SSE 流式响应 |
-| ASGI 服务器 | Uvicorn | 0.34+ | 异步 HTTP 服务器 |
-| Agent 框架 | LangGraph | 0.3+ | StateGraph + 条件路由 + 嵌套子图 |
-| LLM 接入 | LangChain | 0.3+ | ChatDeepSeek / Ollama Embeddings |
-| 主 LLM | DeepSeek `deepseek-chat` | - | 文字对话、Agent 推理、Cypher 生成 |
-| 视觉模型 | 通义千问 VL `qwen-vl-plus` | - | 用户上传图片分析 |
-| 图数据库 | Neo4j | 5.26 | 知识图谱存储与 Cypher 查询 |
-| 关系数据库 | MySQL | 8.0 | 用户/会话/消息持久化 |
-| ORM | SQLAlchemy 2.0 (async) | 2.0+ | 异步数据库操作 |
-| 向量数据库 | Milvus | 2.5 | 60 条预定义查询描述的向量存储与检索 |
-| Embedding | Ollama `bge-m3` | - | 1024 维中文向量化 |
-| 数据库迁移 | Alembic | 1.14+ | MySQL schema 版本管理 |
-| 开发语言 | Python | 3.12+ | 后端全部逻辑 |
-| 前端语言 | JavaScript ES Module | - | Vue 3 组件与组合式 API |
+| 层级 | 技术 | 用途 |
+|------|------|------|
+| 前端框架 | Vue 3.5 + Vite 8 + Vue Router 5 | SPA + 路由守卫 |
+| UI / 样式 | Tailwind CSS v4 + shadcn-vue + motion-v | 暗色 + 珊瑚/薰衣草配色 |
+| 后端框架 | FastAPI 0.115 + Uvicorn | REST + SSE |
+| Agent 框架 | LangGraph 0.3 + langgraph-checkpoint | Supervisor StateGraph + ReAct 子图 + SQLite checkpoint |
+| LLM (主力) | DeepSeek `deepseek-chat` (via `langchain-deepseek`) | classify / decompose / merge / general_chat |
+| LLM (工具) | GPT-5.4 Mini (via `langchain-openai` + aihubmix) | product_qa / order_qa |
+| LLM (推理) | GPT-5.5 (via `langchain-openai` + aihubmix) | after_sales |
+| 图数据库 | Neo4j 5.26 | 产品 / 订单 / FAQ 知识图谱 |
+| 关系数据库 | MySQL 8.0 | 用户 / 会话 / 消息 / 槽位 / 段 |
+| ORM | SQLAlchemy 2.0 async | 异步 DB 访问 |
+| 向量数据库 | Milvus 2.5 (+ etcd + MinIO) | 产品描述向量 |
+| Embedding | Ollama `bge-m3` | 1024 维中文向量 |
+| Migration | Alembic 1.14 | MySQL schema 版本 |
+| 认证 | JWT (HS256) + bcrypt + SHA256(前端) | 登录态 |
+| 日志 | Loguru | 强制 UTF-8 stdout 兼容 Windows GBK |
+| 容器编排 | Docker Compose | MySQL / Neo4j / Milvus / etcd / MinIO |
+
+---
 
 ## 项目结构
 
 ```
 customer/
-├── frontend/                          # Vue 3 前端
+├── frontend/                          Vue 3 前端
 │   ├── src/
-│   │   ├── App.vue                    # 根组件
-│   │   ├── main.js                    # 入口
+│   │   ├── App.vue                    根组件
+│   │   ├── main.js                    入口
+│   │   ├── router/index.js            路由 + beforeEach 守卫
+│   │   ├── views/
+│   │   │   ├── Login.vue              登录 / 注册 (welcome back hero)
+│   │   │   ├── Shop.vue               电商首页
+│   │   │   └── Chat.vue               客服对话 (SSE 接收 + 新对话按钮 + 退出)
 │   │   ├── components/
-│   │   │   ├── ChatPage.vue           # 客服聊天页面 (SSE 流式接收)
-│   │   │   ├── ChatMessage.vue        # 单条消息渲染
-│   │   │   ├── LoginPage.vue          # 登录/注册页
-│   │   │   └── ProductCard.vue        # 产品卡片组件
+│   │   │   ├── PhoneDashboard.vue
+│   │   │   └── ProductCard.vue
 │   │   └── composables/
-│   │       ├── useChat.js             # 聊天逻辑 (SSE, FormData, conversation_id)
-│   │       ├── useAuth.js             # 认证逻辑 (JWT token)
-│   │       └── useProducts.js         # 产品数据
-│   ├── index.html
-│   ├── package.json
-│   └── vite.config.js
+│   │       ├── useAuth.js             JWT 登录 / SHA256 / 自动恢复 thread_id
+│   │       ├── useChat.js             SSE + Bearer + loadHistory
+│   │       └── useScrollReveal.js
+│   ├── vite.config.js                 /api → http://localhost:8000
+│   └── package.json
 │
-├── llm_backend/                       # FastAPI 后端 + LangGraph Agent
-│   ├── main.py                        # FastAPI 应用入口 (挂载路由 + 静态文件)
-│   ├── run.py                         # Uvicorn 启动脚本
-│   ├── .env                           # 环境变量 (不入 git)
-│   ├── .env.example                   # 环境变量模板
-│   ├── Dockerfile                     # Docker 镜像
+├── llm_backend/                       FastAPI 后端 + LangGraph Multi-Agent
+│   ├── main.py                        FastAPI app (CORS + 路由)
+│   ├── run.py                         Uvicorn 启动 (不要 --reload)
+│   ├── .env.example                   环境模板
 │   │
 │   ├── app/
-│   │   ├── api/                       # REST API 路由层
-│   │   │   ├── auth.py                # 登录 / 注册
-│   │   │   ├── chat.py                # DeepSeek 通用对话 (备用)
-│   │   │   ├── langgraph.py           # Agent 对话主入口 (SSE 流式)
-│   │   │   ├── conversations.py       # 会话管理 CRUD
-│   │   │   └── upload.py              # 文件上传
+│   │   ├── api/
+│   │   │   ├── auth.py                /register · /token · /users/me (差异化错误)
+│   │   │   ├── langgraph.py           /langgraph/query (SSE) · conversation 自愈
+│   │   │   └── conversations.py       /conversations/latest · /by-thread/{id}/messages
 │   │   │
-│   │   ├── core/                      # 基础设施层
-│   │   │   ├── config.py              # Pydantic Settings (自动读取 .env)
-│   │   │   ├── database.py            # SQLAlchemy async engine + session
-│   │   │   ├── security.py            # JWT 生成与验证 + OAuth2
-│   │   │   ├── hashing.py             # 密码哈希 (bcrypt)
-│   │   │   ├── logger.py              # Loguru 日志配置
-│   │   │   └── middleware.py           # 请求日志中间件
+│   │   ├── core/
+│   │   │   ├── config.py              pydantic-settings 单例 (改 .env 必须重启)
+│   │   │   ├── database.py            async engine + AsyncSessionLocal
+│   │   │   ├── security.py            JWT + OAuth2 dependency
+│   │   │   ├── hashing.py             bcrypt + 脏数据 try/except 兜底
+│   │   │   └── logger.py              Loguru + sys.stdout.reconfigure utf-8
 │   │   │
-│   │   ├── lg_agent/                  # LangGraph Agent 核心
-│   │   │   ├── lg_builder.py          # 主图构建 (5 节点 + 条件路由)
-│   │   │   │   ├── analyze_and_route_query  # 节点1: LLM 路由分类
-│   │   │   │   ├── respond_to_general_query # 节点2: 闲聊回复
-│   │   │   │   ├── get_additional_info       # 节点3: Guardrails + 补充信息
-│   │   │   │   ├── create_image_query        # 节点4: 图片分析
-│   │   │   │   └── create_research_plan      # 节点5: 知识图谱子图入口
-│   │   │   ├── lg_prompts.py          # 4 套 System Prompt 模板
-│   │   │   ├── lg_states.py           # AgentState / Router / InputState
-│   │   │   ├── utils.py               # UUID 生成
+│   │   ├── lg_agent/                  LangGraph Multi-Agent 核心
+│   │   │   ├── lg_builder.py          build_supervisor_graph + 工具注册表初始化 + checkpointer
 │   │   │   │
-│   │   │   └── kg_sub_graph/          # 知识图谱子图 (核心查询逻辑)
-│   │   │       ├── neo4j_conn.py      # Neo4jGraph 单例
-│   │   │       ├── tools.py           # predefined_cypher / cypher_query Schema
-│   │   │       └── agentic_rag_agents/
-│   │   │           ├── components/
-│   │   │           │   ├── state.py                # 子图状态定义 (11 个 TypedDict)
-│   │   │           │   ├── models.py               # Task 数据类
-│   │   │           │   ├── guardrails/             # Guardrails 节点
-│   │   │           │   ├── planner/                # Planner 节点 (任务拆解)
-│   │   │           │   ├── tool_selection/         # 工具选择节点 (LLM function call)
-│   │   │           │   ├── predefined_cypher/      # 预定义查询
-│   │   │           │   │   ├── node.py             # 匹配执行 (关键词→向量→动态)
-│   │   │           │   │   ├── utils.py            # VectorQueryMatcher (Milvus)
-│   │   │           │   │   ├── cypher_dict.py      # 60 条预定义 Cypher
-│   │   │           │   │   └── descriptions.py     # 60 条中文描述
-│   │   │           │   ├── cypher_tools/           # 动态 Cypher 生成
-│   │   │           │   ├── summarize/              # 结果汇总 (LLM)
-│   │   │           │   └── check_hallucinations/   # 幻觉检测 (循环重试)
-│   │   │           └── workflows/
-│   │   │               └── multi_agent/
-│   │   │                   ├── multi_tool.py       # 子图构建 (5 节点)
-│   │   │                   └── edges.py            # 条件边 + Send 并行
+│   │   │   ├── supervisor/
+│   │   │   │   ├── state.py           SupervisorState · SubTask · WorkerResult · 合并 reducer
+│   │   │   │   └── nodes.py           classify_intent / decompose_tasks / merge_results / respond
+│   │   │   │
+│   │   │   ├── workers/
+│   │   │   │   ├── react_loop.py      通用 Worker 构造器 (create_react_agent + 控制信号解析)
+│   │   │   │   ├── state.py           WorkerInternalState (注意:无 add_messages reducer)
+│   │   │   │   ├── product_qa.py      产品咨询 (语义搜索 / 对比 / 推荐)
+│   │   │   │   ├── order_qa.py        订单查询 / 物流追踪
+│   │   │   │   ├── after_sales.py     售后 (FAQ / 工单 / 升级人工)
+│   │   │   │   ├── general_chat.py    闲聊 (只能 ask_clarification)
+│   │   │   │   └── tools/
+│   │   │   │       ├── schemas.py     Pydantic 工具 schema
+│   │   │   │       ├── executors.py   薄包装 → DataService
+│   │   │   │       └── registry.py    register_tool / create_tool
+│   │   │   │
+│   │   │   ├── data/
+│   │   │   │   ├── data_service.py    ProductService · OrderService · PolicyService
+│   │   │   │   └── neo4j_conn.py      Neo4jGraph 单例
+│   │   │   │
+│   │   │   └── prompts/
+│   │   │       ├── supervisor/        classify · decompose · merge prompts
+│   │   │       └── workers/           think_base 共享提示
 │   │   │
-│   │   ├── models/                    # SQLAlchemy ORM
-│   │   │   ├── user.py                # User
-│   │   │   ├── conversation.py        # Conversation (+DialogueType enum)
-│   │   │   ├── message.py             # Message
-│   │   │   └── __init__.py
+│   │   ├── models/                    SQLAlchemy ORM
+│   │   │   ├── user.py                User
+│   │   │   ├── conversation.py        Conversation (含 summary)
+│   │   │   ├── message.py             Message
+│   │   │   ├── dialogue_state.py      DialogueState (PK = segment_id + worker_type)
+│   │   │   ├── topic_segment.py       TopicSegment (话题段)
+│   │   │   └── user_profile.py        UserProfile (长期画像)
 │   │   │
-│   │   └── services/                  # 业务逻辑层
-│   │       ├── llm_factory.py         # LLM 工厂 (ChatDeepSeek 创建)
-│   │       ├── deepseek_service.py    # DeepSeek 通用对话服务 (备用)
-│   │       ├── conversation_service.py# 会话管理 CRUD
-│   │       └── user_service.py        # 用户管理
+│   │   └── services/
+│   │       ├── llm_factory.py         LLMFactory.create_llm(tier)
+│   │       ├── memory_service.py      write_slot / get_*_segment_slots / get_classify_context
+│   │       ├── segment_manager.py     get_or_open_segment(thread_id) / end_segment
+│   │       ├── profile_builder.py     段结束后压缩 → user_profile
+│   │       ├── conversation_service.py
+│   │       ├── user_service.py
+│   │       └── deepseek_service.py    备用裸调用
 │   │
-│   ├── data/                          # 数据导入脚本
-│   │   ├── import_neo4j_from_csv.py   # CSV → Neo4j 批量导入 (Northwind 数据)
-│   │   ├── import_consumer_data.py    # 消费者向数据 (ProductDetail/FAQ/Policy)
-│   │   └── add_more_products.py       # 批量添加产品 (52 款)
+│   ├── alembic/versions/
+│   │   ├── 1ca69f29aad9_initial_schema.py
+│   │   ├── a1304eeb2d47_add_thread_id_and_update_dialogue_type.py
+│   │   ├── 618835c30a0e_add_memory_tables_dialogue_states_user_.py
+│   │   └── d4f9c2a1e8b3_segment_scoped_slots.py
 │   │
-│   ├── alembic/                       # 数据库迁移
-│   │   ├── env.py                     # Alembic 环境配置
-│   │   ├── script.py.mako             # 迁移脚本模板
-│   │   └── versions/
-│   │       ├── 1ca69f29aad9_initial_schema.py
-│   │       └── a1304eeb2d47_add_thread_id_and_update_dialogue_type.py
+│   ├── scripts/
+│   │   ├── init_db.py
+│   │   └── seed_electronics.py        Neo4j + Milvus demo 数据 (28 产品 / 5 订单 / 14 FAQ)
 │   │
-│   ├── uploads/                       # 用户上传图片 (gitignore)
-│   ├── logs/                          # 应用日志 (gitignore)
-│   └── static/dist/                   # 前端构建产物
+│   └── tests/
+│       ├── test_memory_service.py
+│       └── test_worker_react.py
 │
-├
-├
-└── README.md
+├── docker-compose.yml                 MySQL :3307 / Neo4j :7474+7687 / Milvus :19530
+├── docs/
+│   └── memory-system-v2-recap.md      记忆系统 v2-lite 重构总结
+├── CLAUDE.md                          项目约定 + 不变量 (Claude Code 优先读这里)
+└── README.md                          本文件
 ```
 
-
-### 节点属性
-
-| 标签 | 关键属性 |
-|------|----------|
-| Product | ProductName, UnitPrice, UnitsInStock, CategoryName, SupplierName, QuantityPerUnit |
-| Category | CategoryName, Description |
-| Order | orderId, OrderDate, RequiredDate, ShippedDate, Freight, ShipCountry |
-| Customer | CompanyName, ContactName, Phone, City, Country |
-| Review | CustomerName, Rating, ReviewText, ReviewDate |
-| Supplier | CompanyName, ContactName, Phone, Country |
-| Shipper | CompanyName, Phone |
-| Employee | FirstName, LastName, Title, HireDate, BirthDate, HomePhone |
-| ProductDetail | KeyFeatures, Specifications, SuitableFor, Description |
-| FAQ | category, question, answer |
-| AfterSalesPolicy | policyType, content |
+---
 
 ## 快速开始
 
@@ -226,377 +233,417 @@ customer/
 
 - **Python** 3.12+
 - **Node.js** 18+
-- **Docker Desktop** (运行 Neo4j, Milvus, MySQL)
+- **Docker Desktop** (跑 MySQL / Neo4j / Milvus)
+- **Ollama** + `bge-m3` 模型 (本地 embedding，约 1.2GB)
 - **DeepSeek API Key** ([获取地址](https://platform.deepseek.com/))
+- **GPT (aihubmix) API Key** — 用于 product_qa / order_qa / after_sales
 
-### 2. 创建虚拟环境
+### 2. 启动基础设施
 
-```bash
-cd customer
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # macOS/Linux
-pip install -r llm_backend/requirements.txt
+```powershell
+docker compose up -d
 ```
 
-### 3. 启动基础服务
+这会拉起：
+- MySQL 8.0 (host :3307 → container :3306)
+- Neo4j 5.26 (:7474 / :7687，账号 `neo4j` / `12345678`)
+- Milvus 2.5 (:19530) + etcd + MinIO
 
-```bash
-# Neo4j 图数据库
-docker run -d --name neo4j \
-  -p 7474:7474 -p 7687:7687 \
-  -e NEO4J_AUTH=neo4j/12345678 \
-  -e NEO4J_PLUGINS='["apoc"]' \
-  neo4j:5
+> **注意**: docker-compose 把 MySQL 映射到 **3307**(host)，因为本地 MySQL 通常占着 3306。所以下面 `.env` 里要写 `DB_PORT=3307`。
 
-# Milvus 向量数据库 (包含 etcd + MinIO)
-docker compose -f docker-compose-milvus.yml up -d
+### 3. Ollama embedding 模型
 
-# MySQL
-docker run -d --name mysql \
-  -p 3306:3306 \
-  -e MYSQL_ROOT_PASSWORD=123456 \
-  -e MYSQL_DATABASE=constomer \
-  mysql:8.0
-
-# Ollama + bge-m3 模型
-ollama serve                    # 如果已安装
+```powershell
+ollama serve
 ollama pull bge-m3
 ```
 
-### 4. 配置环境变量
+### 4. Python 虚拟环境
 
-```bash
-cd llm_backend
-cp .env.example .env
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r llm_backend\requirements.txt
 ```
 
-编辑 `.env`，至少填入：
+### 5. 配置 `.env`
+
+```powershell
+cd llm_backend
+Copy-Item .env.example .env
+notepad .env
+```
+
+至少需要填：
 
 ```env
-DEEPSEEK_API_KEY=sk-your-key-here
+DEEPSEEK_API_KEY=sk-xxx
+GPT_API_KEY=sk-xxx              # aihubmix
+GPT_BASE_URL=https://aihubmix.com/v1
+GPT_TOOL_MODEL=gpt-5-mini       # 实际型号见 services/llm_factory.py 注释
+GPT_REASON_MODEL=gpt-5
+DB_PORT=3307                    # Docker MySQL 暴露的是 3307
+DB_PASSWORD=123456              # 匹配 docker-compose.yml 里的 MYSQL_ROOT_PASSWORD
+NEO4J_PASSWORD=12345678
+SECRET_KEY=<openssl rand -hex 32 的输出>
 ```
 
-其他配置项均有默认值，可直接使用。
+### 6. 初始化数据库
 
-### 5. 初始化数据库
-
-```bash
-# MySQL 建表
+```powershell
 cd llm_backend
-../.venv/Scripts/python.exe -m alembic upgrade head
-
-# Neo4j 导入数据 (按顺序执行)
-../.venv/Scripts/python.exe data/import_neo4j_from_csv.py
-../.venv/Scripts/python.exe data/import_consumer_data.py
-../.venv/Scripts/python.exe data/add_more_products.py
+python -m alembic upgrade head
+python scripts\seed_electronics.py
 ```
 
-### 6. 启动后端
+`seed_electronics.py` 会往 Neo4j + Milvus 写入 28 款消费电子 / 5 条订单 / 14 条 FAQ。
 
-```bash
+### 7. 启动后端
+
+```powershell
 cd llm_backend
-../.venv/Scripts/python.exe run.py
+python run.py
+# 或 python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-访问 `http://localhost:8000` 即可使用。
+> 不要加 `--reload`。`pydantic-settings` 是缓存单例，`--reload` 只监听 `.py`，改 `.env` 不会被发现。
 
-### 7. 前端开发（可选）
+### 8. 启动前端
 
-后端已托管前端静态文件。如需修改前端：
-
-```bash
+```powershell
 cd frontend
 npm install
-npm run dev       # 开发模式 (localhost:5173)
-npm run build     # 构建到 ../llm_backend/static/dist/
+npm run dev
 ```
+
+打开 `http://localhost:5173`，注册一个账号即可进入聊天页。
+
+---
 
 ## 配置参考
 
-### 环境变量 (.env)
+### 主要环境变量
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `DEEPSEEK_API_KEY` | (必填) | DeepSeek API 密钥 |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | DeepSeek API 地址 |
-| `DEEPSEEK_MODEL` | `deepseek-chat` | 使用的模型 |
-| `VISION_API_KEY` | (可选) | 通义千问 VL API 密钥 |
-| `VISION_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 视觉模型地址 |
-| `VISION_MODEL` | `qwen-vl-plus` | 视觉模型名称 |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 服务地址 |
-| `OLLAMA_EMBEDDING_MODEL` | `bge-m3` | Embedding 模型名称 |
-| `DB_HOST` | `localhost` | MySQL 主机 |
-| `DB_PORT` | `3306` | MySQL 端口 |
-| `DB_USER` | `root` | MySQL 用户名 |
-| `DB_PASSWORD` | (必填) | MySQL 密码 |
-| `DB_NAME` | `constomer` | 数据库名 |
-| `NEO4J_URL` | `bolt://localhost:7687` | Neo4j Bolt 地址 |
-| `NEO4J_USERNAME` | `neo4j` | Neo4j 用户名 |
-| `NEO4J_PASSWORD` | `12345678` | Neo4j 密码 |
-| `NEO4J_DATABASE` | `neo4j` | Neo4j 数据库名 |
-| `MILVUS_HOST` | `localhost` | Milvus 主机 |
-| `MILVUS_PORT` | `19530` | Milvus 端口 |
-| `MILVUS_COLLECTION` | `predefined_cypher_vectors` | Milvus Collection 名 |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | DeepSeek endpoint |
+| `DEEPSEEK_MODEL` | `deepseek-chat` | **不要改成 `deepseek-v4-flash` 之类，会触发 reasoner 检测,工具调用直接 500** |
+| `GPT_API_KEY` | (必填) | GPT 工具/推理档密钥 (aihubmix) |
+| `GPT_BASE_URL` | `https://aihubmix.com/v1` | aihubmix 中转 |
+| `GPT_TOOL_MODEL` | (必填) | 工具档模型名 (`gpt-5.4-mini` 类) |
+| `GPT_REASON_MODEL` | (必填) | 推理档模型名 (`gpt-5.5`) |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 地址 |
+| `OLLAMA_EMBEDDING_MODEL` | `bge-m3` | 1024 维 embedding |
+| `DB_HOST` / `DB_PORT` | `localhost` / `3307` | MySQL (Docker 映射) |
+| `DB_USER` / `DB_PASSWORD` / `DB_NAME` | `root` / (必填) / `constomer` | MySQL 连接 |
+| `NEO4J_URL` | `bolt://localhost:7687` | Neo4j Bolt |
+| `NEO4J_PASSWORD` | (必填) | 默认 `12345678` |
+| `MILVUS_HOST` / `MILVUS_PORT` | `localhost` / `19530` | Milvus |
 | `SECRET_KEY` | (必填) | JWT 签名密钥 |
-| `EMBEDDING_THRESHOLD` | `0.90` | 向量相似度阈值 |
-| `CHECKPOINT_DB_PATH` | `checkpoints.db` | LangGraph 对话记忆路径 |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | `30` | JWT 有效期 |
+| `ALLOWED_ORIGINS` | `*` | CORS,生产改成实际域名 |
+| `LANGCHAIN_TRACING_V2` | `false` | LangSmith 追踪开关 |
+| `LANGCHAIN_API_KEY` | (可选) | LangSmith 密钥 |
 
-### 服务端口总览
+### 服务端口
 
-| 服务 | 端口 | 说明 |
-|------|------|------|
-| FastAPI 后端 | 8000 | Web 页面 + API |
-| Neo4j Browser | 7474 | 图数据库可视化 |
-| Neo4j Bolt | 7687 | Cypher 查询协议 |
-| Milvus | 19530 | 向量数据库 |
-| MySQL | 3306 | 关系数据库 |
-| Ollama | 11434 | Embedding 模型服务 |
+| 服务 | Host 端口 | 容器端口 | 说明 |
+|------|-----------|----------|------|
+| FastAPI | 8000 | — | 后端 API |
+| Vite 前端 | 5173 | — | 开发模式 |
+| MySQL | **3307** | 3306 | docker-compose 映射 |
+| Neo4j Browser | 7474 | 7474 | http://localhost:7474 |
+| Neo4j Bolt | 7687 | 7687 | bolt:// 协议 |
+| Milvus | 19530 | 19530 | gRPC |
+| MinIO Console | 9001 | 9001 | (内部用) |
+| Ollama | 11434 | — | 本地装的，不在 docker-compose 里 |
 
-## API 文档
+---
 
-启动后访问 `http://localhost:8000/docs` 查看 Swagger UI。
+## 关键模块详解
 
-### 核心端点
+### Supervisor + 4 Worker
 
-**`POST /api/langgraph/query`** — Agent 对话（SSE 流式）
+**Supervisor 图**(`app/lg_agent/lg_builder.py` + `supervisor/nodes.py`)：
 
+| 节点 | 职责 | 用的 LLM |
+|------|------|----------|
+| `classify_intent` | 把用户消息分到 1-N 个 Worker，重写 query (带历史指代解析) | flash |
+| `decompose_tasks` | 多 Worker 场景下拆成 `SubTask[]` | flash (条件触发) |
+| Send dispatch | LangGraph `Send` API 并行启动 Worker 子图 | — |
+| `merge_results` | 合并多 Worker 结果。fast-path(confidence ≥ 0.5 且非 fallback)直接透传；否则 LLM 合成 | flash |
+| `respond` | token-by-token 流式输出 `final_answer` | flash (复用 merge 产物) |
+
+**Worker 子图**(`workers/react_loop.py:build_worker`):
+
+每个 Worker = `create_react_agent` + 一层薄 StateGraph 壳。壳子负责：
+- 注入身份提示 (`prompts/workers/think_base.py` + Worker 自己的）
+- 限制工具集 (`product_qa` 只能调 product 相关工具)
+- 解析最后一条工具结果的 `control` 字段（`clarify` / `escalate` / `reroute`）
+- 算 `confidence`（基于工具调用次数 + 是否返回 fallback 文案）
+- 提取 `slots`（工具结果里的结构化字段)
+- 输出 `WorkerResult { final_answer, confidence, control, slots, worker_type }`
+
+### 三档 LLM 路由
+
+`services/llm_factory.py::LLMFactory.create_llm(tier)`：
+
+| Tier | 模型 | 用在哪 | 为什么 |
+|------|------|--------|--------|
+| `flash` | DeepSeek `deepseek-chat` | classify / decompose / merge / general_chat / respond | 中文强、便宜、不/弱工具调用够用 |
+| `tool` | GPT-5.4 Mini (aihubmix) | product_qa / order_qa | 工具调用最稳，多步 ReAct 不漂 |
+| `reason` | GPT-5.5 (aihubmix) | after_sales | 退换货/赔付场景要推理 + 同理心 |
+
+Worker → tier 映射在 `lg_builder.build_supervisor_graph` 的 `_worker_llm_map` dict 里改。
+
+### DataService 数据层
+
+`app/lg_agent/data/data_service.py` 用三个 Service 类把所有 Milvus + Neo4j 访问收口：
+
+- `ProductService` — `semantic_search` / `compare_products` / `recommend`
+- `OrderService` — `track_shipment` / 订单查询
+- `PolicyService` — `search_faq`
+
+工具执行器 (`workers/tools/executors.py`) 只做参数提取 + 调 Service。**加新数据访问写在 Service 层，不要写在 executor 或散落的 Cypher 字典里。**
+
+> `app/lg_agent/data/cypher_dict.py` / `descriptions.py` / `vector_matcher.py` 是 pre-refactor 残留，**不在主流程上**，不要给新代码用。
+
+### 工具注册表
+
+`workers/tools/registry.py` 提供两个 API：
+
+```python
+register_tool(name, executor)        # 启动时绑定 executor
+create_tool(schema_cls)              # 用 Pydantic schema + executor 拼成 StructuredTool 给 ReAct
 ```
-请求 (multipart/form-data):
-  query: "有哪些智能空调"
-  user_id: 1
-  conversation_id: (可选，用于保持对话上下文)
 
-响应 (SSE):
-  data: {"status":"thinking","msg":"对方正在输入..."}
-  data: "您好～亲..."
-  data: "谷歌 智能空调 Basic..."
-  ...
-
-响应头:
-  X-Conversation-ID: <UUID>  (前端保存此 ID 用于后续对话)
-```
-
-**`GET /health`** — 健康检查
+工具返回值统一格式：
 
 ```json
 {
-  "status": "ok",
-  "neo4j": true,
-  "mysql": true
+  "success": true | false,
+  "error": "msg" | null,
+  "control": { "action": "clarify" | "escalate" | "reroute" } | null,
+  "...payload": ...
 }
 ```
 
-### 其他端点
+`control.action` 是 Worker → Supervisor 的反馈通道。
+
+### 记忆系统 v2-lite
+
+设计目标是修掉 v1 的**跨 Worker 槽位污染**，同时保留分段抽象给未来扩展。
+
+**核心存储**(MySQL)：
+
+| 表 | 主键 | 作用 |
+|----|------|------|
+| `conversations` | id | 一条完整对话(含 summary) |
+| `topic_segments` | id (FK conversation) | 话题段。`ended_at IS NULL` 表示当前活跃段。v2-lite 没触发 end_segment，所以**一条 conversation = 一个永久段** |
+| `dialogue_states` | **(segment_id, worker_type)** | 槽位。product_qa 和 order_qa 各占一行，互不污染 |
+| `user_profiles` | user_id | 跨段沉淀的偏好画像 |
+| `messages` | id | 原始消息 |
+
+**调用流**：
+
+```
+classify_intent
+  ├── SegmentManager.get_or_open_segment(thread_id) → segment_id
+  ├── MemoryService.get_classify_context(thread_id, segment_id, user_id)
+  │     返回带标签的分组槽位:
+  │       [order_qa记录]   {"last_order_id": "1001"}
+  │       [product_qa记录] {"products_mentioned": ["iPhone16"]}
+  │       [用户偏好]       {"budget_max": 5000}
+  │       [对话摘要]       "上一段聊了什么"
+  └── LLM 读这些上下文做 query rewrite
+
+merge_results
+  └── 对每个 worker_result:
+        MemoryService.write_slot(segment_id, worker_type, slots)
+        → (segment_id, worker_type) 行被 UPSERT
+```
+
+**关键修复**(`merge_results`)：
+
+- **去掉 merge_prompt 里的"对话历史"字段** — 它是污染源（上轮订单 #1001 会被混进本轮 iPhone 推荐）。
+- **fast-path 阈值 0.7 → 0.5** — 中性置信度直接透传 Worker 答案，跳过 LLM 二次合成。
+
+完整设计与"刻意没做的事"清单见 [docs/memory-system-v2-recap.md](docs/memory-system-v2-recap.md)。
+
+### 登录与会话恢复
+
+| 端点 | 行为 |
+|------|------|
+| `POST /api/register` | 注册，前端先 SHA256 一次 |
+| `POST /api/token` | 登录,**区分** "该邮箱未注册" / "密码错误，请重试" (demo 优先 UX,生产可改成统一文案防枚举) |
+| `GET /api/conversations/latest` | 返回当前用户最近一条对话的 `thread_id`，登录后自动调，存到 localStorage |
+| `GET /api/conversations/by-thread/{thread_id}/messages` | JWT 鉴权后拉历史消息,Chat.vue `onMounted` 调 |
+
+前端 `useAuth.login()` 成功后会立即拉 `/conversations/latest` 写到 `localStorage.lingxi_conversation_id`，Chat 页 mount 时 `loadHistory()` 把消息打回界面。退出再登回来对话不丢。
+
+后端 `/api/langgraph/query` 拿到 `conversation_id` 时先查 DB，找不到就 INSERT 一条（**自愈机制** — 解决浏览器 localStorage 与 DB 不同步，比如 DB 被重置后浏览器还存着旧 thread_id）。
+
+---
+
+## API 文档
+
+启动后端后访问 `http://localhost:8000/docs` 看 Swagger UI。
+
+### 核心端点
+
+**`POST /api/langgraph/query`** — Multi-Agent 对话 (SSE)
+
+```
+请求 (multipart/form-data):
+  query: "对比小米15和iPhone16"
+  user_id: 1
+  conversation_id: <thread_id>      (可选,首次请求留空)
+
+请求头:
+  Authorization: Bearer <JWT>
+
+响应 (SSE event-stream):
+  event: status
+  data: {"phase":"classify","msg":"理解意图中..."}
+
+  event: status
+  data: {"phase":"workers","msg":"调用 product_qa..."}
+
+  data: "您好~亲~"
+  data: "小米15..."
+  ...
+
+响应头:
+  X-Conversation-ID: <thread_id>
+```
+
+**`GET /api/users/me`** — 当前登录用户信息 (JWT)
+
+### 认证端点
 
 | 端点 | 方法 | 认证 | 说明 |
 |------|------|------|------|
-| `/api/token` | POST | 否 | 登录，返回 JWT |
-| `/api/register` | POST | 否 | 用户注册 |
-| `/api/chat` | POST | 否 | DeepSeek 通用对话 (SSE, 备用) |
-| `/api/conversations` | GET | 是 | 获取用户的所有会话 |
-| `/api/conversations` | POST | 是 | 创建新会话 |
-| `/api/conversations/{id}` | DELETE | 是 | 删除会话 |
-| `/api/conversations/{id}/messages` | GET | 是 | 获取会话消息 |
-| `/api/validate-token` | GET | 是 | 验证 JWT 有效性 |
+| `/api/register` | POST | 否 | 注册 |
+| `/api/token` | POST | 否 | 登录 → JWT (差异化错误) |
+| `/api/users/me` | GET | 是 | 获取当前用户 |
 
-## Agent 工作流详解
+### 会话端点
 
-### 路由分类 (Router)
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/conversations/latest` | GET | 最近一条对话(用于登录恢复) |
+| `/api/conversations/by-thread/{tid}/messages` | GET | 按 thread_id 拉历史 |
 
-LLM 将用户问题分为 4 类：
-
-| 类型 | 触发条件 | 后续处理 |
-|------|----------|----------|
-| `general-query` | 闲聊、问候 | 直接 LLM 回复 |
-| `additional-query` | 信息不足、非经营范围 | Guardrails 拦截 + 引导补充 |
-| `graphrag-query` | 需要查询知识库 | 进入子图查询流程 |
-| `image-query` | 用户上传图片 | 通义千问 VL 分析 |
-
-### 守卫拦截 (Guardrails)
-
-位于 `get_additional_info` 节点，拦截超出经营范围的问题（如服饰、食品、体育用品）。带对话历史上下文，避免"50"被误判。
-
-### 任务拆解 (Planner)
-
-LLM 将复杂问题拆为 1-3 个独立子任务：
-
-```
-"对比小米和华为的智能手环" → [
-  "查询小米智能手环的价格和功能",
-  "查询华为智能手环的价格和功能"
-]
-```
-
-### 工具选择 (Tool Selection)
-
-LLM function call 为每个子任务选择工具：
-
-| 工具 | 适用场景 | 特点 |
-|------|----------|------|
-| `predefined_cypher` | 90% 常见问题 | 快 (60 条预制查询) |
-| `cypher_query` | 复杂自定义查询 | 准 (LLM 动态生成 Cypher) |
-
-### 查询执行
-
-三层降级策略：
-
-```
-关键词匹配 (优先) → Milvus 向量检索 (备用) → LLM 动态生成 Cypher (最终)
-     ↓ 命中                  ↓ 命中                    ↓
-  Neo4j 执行             Neo4j 执行              Neo4j 执行
-```
-
-关键词匹配覆盖：订单、物流、价格、评价、员工、产品详情、退货、保修、FAQ、支付。有明确约束(数字/品类名)的任务跳过兜底，直接交给动态 Cypher。
-
-### 结果汇总 (Summarize)
-
-LLM 将查询结果整理为客服风格的自然语言：
-
-- 开场用"亲～"或"您好～"
-- 适当使用 emoji
-- 产品信息清晰列出
-- 无结果时礼貌引导
-
-### 幻觉检测 (Hallucination Check)
-
-LLM 审核回答是否基于查询结果，防止编造数据。如果检测到幻觉（score: no/half），回到 Summarize 重新生成（最多重试 3 次）。
-
-## 预定义 Cypher 查询
-
-**60 条**预定义查询，覆盖 11 个类别：
-
-| 类别 | 条数 | 示例查询 |
-|------|------|----------|
-| 产品查询 | 10 | product_by_name, products_price_range, expensive_products |
-| 订单查询 | 8 | order_by_id, recent_orders, orders_by_country |
-| 客户查询 | 5 | customer_by_name, customers_by_country, all_customers |
-| 员工查询 | 5 | employee_list, employee_orders, employee_subordinates |
-| 评价查询 | 4 | product_reviews, low_rated_reviews, recent_reviews |
-| 销售分析 | 4 | category_sales, product_sales, sales_trend |
-| 供应商 | 3 | supplier_products, all_suppliers |
-| 类别 | 3 | all_categories, category_products |
-| 物流 | 3 | order_shipping, shipper_list |
-| 消费者 | 10 | product_detail, faq_search, return_policy, warranty_policy |
-| 其他 | 5 | smart_home_products, also_bought, inventory_summary |
-
-完整列表见 `llm_backend/app/lg_agent/kg_sub_graph/agentic_rag_agents/components/predefined_cypher/cypher_dict.py`
-
-## 查询匹配策略
-
-查询执行采用 **关键词优先 + 向量兜底 + 动态降级** 的三层策略：
-
-```
-用户问题 → 参数提取 (订单号/金额/产品名)
-         → 关键词匹配 (60 条正则规则)
-            ├── 命中 → Neo4j 执行 → 返回
-            └── 未命中
-                → Milvus 向量检索 (bge-m3, top-5)
-                   ├── 命中 → Neo4j 执行 → 返回
-                   └── 未命中
-                       → 有约束(数字/品类) → 降级到 LLM 动态生成 Cypher
-                       → 无约束 → 兜底 smart_home_products
-```
-
-设计理念：
-- **关键词主力**：准确率高，零延迟，覆盖 90% 常见问法
-- **Milvus 兜底**：向量语义匹配，覆盖变体问法
-- **动态降级**：复杂跨实体查询交给 LLM 现场写 Cypher
+---
 
 ## 数据库迁移
 
-使用 Alembic 管理 MySQL schema 版本：
-
-```bash
+```powershell
 cd llm_backend
 
-# 生成新迁移 (自动检测 model 变更)
-python -m alembic revision --autogenerate -m "描述"
-
-# 升级到最新版本
+# 升级到最新
 python -m alembic upgrade head
 
-# 回滚一个版本
+# 自动生成迁移
+python -m alembic revision --autogenerate -m "<描述>"
+
+# 回滚一步
 python -m alembic downgrade -1
 
-# 查看当前版本
+# 当前版本
 python -m alembic current
 ```
 
-当前迁移历史：
-- `1ca69f29aad9` — initial_schema (users, conversations, messages)
-- `a1304eeb2d47` — 添加 thread_id 列 + 更新 DialogueType 枚举
+迁移历史：
 
-## 部署
+| Revision | 说明 |
+|----------|------|
+| `1ca69f29aad9` | initial — users / conversations / messages |
+| `a1304eeb2d47` | conversations.thread_id + DialogueType 枚举 |
+| `618835c30a0e` | 记忆 v1 — dialogue_states / user_profiles |
+| `d4f9c2a1e8b3` | **记忆 v2-lite** — topic_segments + dialogue_states.PK 改为 (segment_id, worker_type) |
 
-```bash
-# 1. 构建前端
-cd frontend && npm run build && cd ..
+---
 
-# 2. 配置环境
-cp llm_backend/.env.example llm_backend/.env
-vim llm_backend/.env   # 填入 DEEPSEEK_API_KEY
+## 项目不变量（看代码前先读这里）
 
-# 3. 启动全部服务
-docker compose up -d
+> 这些约定来自 `CLAUDE.md`。改代码之前先确认这些事情不会被你打破。
 
-# 4. 初始化数据库 (首次)
-docker exec constomer-backend python -m alembic upgrade head
-```
+1. **`DEEPSEEK_MODEL=deepseek-chat`** — 不要改成 `deepseek-v4-flash` 之类。`langchain-deepseek` 按模型名 pattern match，"v4-flash" 会被误判成 reasoner，工具调用直接 `tool_choice not supported` 500。
+2. **`WorkerInternalState.messages` 没有 `add_messages` reducer** — SQLite checkpointer 跨轮持久化 state，加 reducer 会让上一轮 Worker 的 AIMessage 漏进本轮 Send，ReAct agent 会去 replay。
+3. **`merge_results` 每条路径都必须写 `final_answer`** — `respond_node` 读 `state["final_answer"]`，漏写会读上轮缓存。
+4. **`_build_sends` 只塞一条 `HumanMessage(task.description)`** — 不传历史。多轮上下文通过 classify 改写后的 description 传，不通过 messages 列表。
+5. **日志一律用 `loguru`** — `from loguru import logger as _log`。Windows PowerShell stdout 默认 GBK，`print` 或 stdlib `logging` 输出 emoji 会 `UnicodeEncodeError`。
+6. **`main.py` 不挂前端静态资源** — 后端只跑 API on :8000，前端独立 Vite dev :5173。
+7. **`uvicorn` 不开 `--reload`** — `pydantic-settings` 是缓存单例，`--reload` 只监听 `*.py`，改 `.env` 必须整个重启。
 
-| 服务 | 容器名 | 说明 |
-|------|--------|------|
-| mysql | constomer-mysql | MySQL 8.0 (端口 3306) |
-| ollama | constomer-ollama | Ollama + bge-m3 (端口 11434) |
-| backend | constomer-backend | FastAPI (端口 8000) |
+资源限制：`MAX_RECURSION=30` (Worker ReAct 步数)、`MAX_REROUTE=2` (Supervisor 重路由次数)、`_LLM_SEMAPHORE=3` (并发 LLM 调用,挡 429)。
 
+---
 
 ## 常见问题
 
-### Q: 为什么回复很慢 (30-60 秒)?
+### Q: 为什么不用 `git add -A`?
 
-每次对话调用 5-6 次 DeepSeek API（路由、守卫、规划、工具选择、汇总、幻觉检测），每次 5-15 秒。已关闭子图 Guardrails 减少一次调用。如需进一步加速，考虑换用更快的模型或关闭幻觉检测。
+`.env` 含 secrets，`uploads/` 是用户图，`logs/` 是运行时日志，都不该入库。一律按名字 `git add file1 file2 ...` 显式 stage。
 
-### Q: 为什么有时说"暂时无法回答"?
+### Q: 启动报 `bcrypt.checkpw ValueError: Invalid salt`?
 
-- 守卫拦截了非经营范围问题（如买衣服）
-- 查询执行失败且动态 Cypher 也未成功
-- LLM 返回空内容
+数据库里有 demo 用户的 `password_hash` 字段是非 bcrypt 格式(比如手动 seed 写了 `'x'`)。`core/hashing.py` 已加 `try/except` 兜底，登录会正常返回 401 而不是 500。需要清掉脏数据 → `DELETE FROM users WHERE password_hash NOT LIKE '$2b$%'`。
 
-### Q: 如何添加新的预定义查询?
+### Q: 改了 `.env` 没生效?
 
-1. 在 `cypher_dict.py` 添加 Cypher 语句
-2. 在 `descriptions.py` 添加中文描述
-3. 删除 Milvus collection 让向量重新生成
-4. 如需要，在 `node.py` 的 fallback 关键词中添加匹配规则
+`pydantic-settings` 缓存单例 + `--reload` 不监听 `.env`。**必须**结束 uvicorn 进程整个重启。
 
-### Q: 如何添加新产品?
+### Q: 回复夹杂上轮内容(比如问 iPhone 推荐却看到上轮的订单 #1001)?
 
-运行 `data/add_more_products.py` 或直接在 Neo4j Browser 中执行 Cypher：
+记忆 v2-lite 已修了三个污染源：
+1. 跨 Worker 槽位隔离 `(segment_id, worker_type)`
+2. `merge_prompt` 不再注入对话历史
+3. `fast-path` 阈值 0.7 → 0.5,中性置信度直接透传
 
-```cypher
-CREATE (p:Product {ProductName:'新产品', UnitPrice:'999', UnitsInStock:'100', CategoryName:'智能空调', SupplierName:'小米智能家居'})
-WITH p
-MATCH (c:Category {CategoryName:'智能空调'}), (s:Supplier {CompanyName:'小米智能家居'})
-CREATE (p)-[:BELONGS_TO]->(c), (p)-[:SUPPLIED_BY]->(s)
+如果还出现，先看 `merge_results` 节点的 fast-path 是否被跳过（`logs/` 里看 `confidence` 值），然后看 `dialogue_states` 表确认槽位没串。
+
+### Q: Milvus 起不来 / collection 不存在?
+
+```powershell
+docker compose restart milvus
+python llm_backend\scripts\seed_electronics.py  # 重新灌数据 + 建 collection
 ```
 
-新数据即时生效，无需重启。
-
-### Q: Ollama 启动后需要手动拉模型吗?
-
-首次启动时需要：`ollama pull bge-m3`。Docker Compose 版本会自动拉取。
-
-### Q: Milvus collection 什么时候需要重建?
-
-修改了 `cypher_dict.py` 或 `descriptions.py` 后，需要删除 collection 让向量重新生成：
+如果 collection schema 改了，需要先在 Python 里 drop 再 seed：
 
 ```python
 from pymilvus import MilvusClient
-MilvusClient(uri='http://localhost:19530').drop_collection('predefined_cypher_vectors')
+MilvusClient(uri='http://localhost:19530').drop_collection('product_descriptions')
 ```
 
-下次 Agent 查询时会自动重建。
+### Q: 前端 5173 起不来?
+
+```powershell
+cd frontend
+npm install   # 如果是新克隆
+npm run dev
+```
+
+确认 `vite.config.js` 里的代理还是 `'/api': 'http://localhost:8000'`。
+
+### Q: 退出登录后历史聊天还能看到吗?
+
+能。登录后 `useAuth.login` 会拉 `/api/conversations/latest`，把 `thread_id` 存到 `localStorage.lingxi_conversation_id`,进到 Chat.vue `onMounted` 时调 `loadHistory(thread_id)` 把消息打回。
+
+### Q: 想清掉所有数据从头开始?
+
+```powershell
+docker compose down -v     # 注意 -v 会清 volume,MySQL/Neo4j/Milvus 全清空
+docker compose up -d
+cd llm_backend
+python -m alembic upgrade head
+python scripts\seed_electronics.py
+```
+
+---
 
 ## License
 

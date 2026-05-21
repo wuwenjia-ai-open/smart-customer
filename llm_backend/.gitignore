@@ -1,1 +1,3 @@
 checkpoints.db*
+.env
+*.env

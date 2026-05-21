@@ -24,6 +24,7 @@ class WorkerResult(TypedDict):
     confidence: float  # 0.0-1.0，工具成功率越高越可信
     reroute_to: str  # 非空时 Supervisor 重新分发到此 Worker
     control_action: str  # clarify | escalate | reroute | ""
+    slots: Dict[str, Any]  # 本轮工具执行中提取的对话槽位
 
 
 def add_or_reset_worker_results(
@@ -55,3 +56,4 @@ class SupervisorState(TypedDict):
     needs_clarification: bool
     pending_clarification: str
     reroute_count: int  # 重路由次数，上限 2 防止死循环
+    segment_id: int  # 当前话题段 ID，由 classify_intent 写入，merge_results 读取

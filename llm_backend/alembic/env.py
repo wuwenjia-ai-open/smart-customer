@@ -24,7 +24,7 @@ _sync_url = settings.DATABASE_URL.replace("mysql+aiomysql", "mysql+pymysql")
 config.set_main_option("sqlalchemy.url", _sync_url)
 
 # 所有模型的 MetaData, 用于 autogenerate
-from app.models import User, Conversation, Message  # noqa: F401
+from app.models import User, Conversation, Message, DialogueState, UserProfile  # noqa: F401
 target_metadata = Base.metadata
 
 

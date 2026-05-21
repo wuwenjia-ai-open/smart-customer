@@ -1,7 +1,6 @@
 """Worker Agent — LangChain create_agent 薄封装"""
 import asyncio
 import json
-import logging
 import re
 from operator import add
 from typing import Annotated, Any, Dict, List, Optional
@@ -12,10 +11,9 @@ from langgraph.prebuilt import create_react_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
 from typing_extensions import TypedDict
+from loguru import logger as _log
 
 from app.lg_agent.supervisor.state import WorkerResult
-
-_log = logging.getLogger(__name__)
 
 # 全局信号量，限制并行 LLM API 调用数，防止 429 限流
 _LLM_SEMAPHORE = asyncio.Semaphore(3)
@@ -54,6 +52,22 @@ def _parse_control_signal(tool_msgs: List[ToolMessage]) -> Optional[dict]:
     return None
 
 
+def _collect_slots(tool_msgs: List[ToolMessage]) -> dict:
+    """从 ToolMessage 列表中提取所有 slots,后写覆盖同 key。"""
+    merged: dict = {}
+    for msg in tool_msgs:
+        content = getattr(msg, "content", "") or ""
+        if not content:
+            continue
+        try:
+            data = json.loads(content.strip())
+            if isinstance(data, dict) and data.get("slots"):
+                merged.update(data["slots"])
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    return merged
+
+
 def _compute_confidence(all_msgs: list) -> float:
     """基于工具返回的 success 字段计算置信度"""
     tool_count = 0
@@ -89,8 +103,13 @@ def _compute_confidence(all_msgs: list) -> float:
 
 
 class WorkerInternalState(TypedDict):
-    """Worker 内部隔离状态 — 不会泄露到 Supervisor"""
-    messages: Annotated[List[AnyMessage], add_messages]
+    """Worker 内部隔离状态 — 不会泄露到 Supervisor
+
+    messages 不用 add_messages reducer：避免 checkpoint 把上轮 worker
+    残留的对话追加到本轮 Send 传入的单条 HumanMessage，导致 ReAct agent
+    看到上轮 AIMessage 后复用其内容。
+    """
+    messages: List[AnyMessage]
 
 
 class WorkerOutputState(TypedDict):
@@ -112,6 +131,7 @@ def _fallback(worker_type: str, message: str) -> Dict[str, Any]:
             confidence=0.0,
             reroute_to="",
             control_action="",
+            slots={},
         )],
     }
 
@@ -128,7 +148,13 @@ def build_worker(llm: BaseChatModel, tools: list, system_prompt: str, worker_typ
     builder = StateGraph(WorkerInternalState, output=WorkerOutputState)
 
     async def execute(state: WorkerInternalState) -> Dict[str, Any]:
-        _log.info(f"Worker {worker_type}: executing react agent")
+        msg_summary = " | ".join(
+            f"{type(m).__name__}:{(getattr(m, 'content', '') or '')[:30]}"
+            for m in state["messages"]
+        )
+        _log.info(f"Worker {worker_type}: received {len(state['messages'])} msgs [{msg_summary}]")
+
+        original_len = len(state["messages"])  # 记录原始历史长度，区分新生成内容
 
         async with _LLM_SEMAPHORE:
             try:
@@ -141,16 +167,20 @@ def build_worker(llm: BaseChatModel, tools: list, system_prompt: str, worker_typ
                 return _fallback(worker_type, "处理步骤过多，已为您简化回答。")
 
         all_msgs = result.get("messages", [])
+        # 只看本轮 react_agent 新追加的消息，避免误把上轮的 AIMessage 当成本轮答案
+        new_msgs = all_msgs[original_len:]
 
-        # 收集所有 ToolMessage 用于 control 信号检测
-        tool_msgs = [m for m in all_msgs if isinstance(m, ToolMessage)]
+        # 收集本轮 ToolMessage 用于 control 信号检测
+        tool_msgs = [m for m in new_msgs if isinstance(m, ToolMessage)]
 
         # 结构化 control 信号检测
         control = _parse_control_signal(tool_msgs)
+        # 提取本轮工具执行的 slots
+        worker_slots = _collect_slots(tool_msgs)
 
-        # 提取最终回答
+        # 提取本轮最终回答（只在新消息里找）
         answer = ""
-        for m in reversed(all_msgs):
+        for m in reversed(new_msgs):
             if isinstance(m, AIMessage) and not getattr(m, "tool_calls", None):
                 content = getattr(m, "content", "") or ""
                 if content:
@@ -165,8 +195,16 @@ def build_worker(llm: BaseChatModel, tools: list, system_prompt: str, worker_typ
         answer = re.sub(r'\s*\[ESCALATE\]\s*', '', answer)
         answer = answer.strip()
 
-        # 计算置信度
-        confidence = _compute_confidence(all_msgs)
+        # 兜底：如果 answer 以第三人称分析语句开头，说明 prompt 指令未被遵守，
+        # 截取第一个"亲～"之后的内容；若无则降级
+        _ANALYSIS_PREFIXES = ("用户咨询", "用户表示", "用户想", "用户在", "根据分析", "分析：")
+        if any(answer.startswith(p) for p in _ANALYSIS_PREFIXES):
+            _log.warning(f"Worker {worker_type}: answer starts with analysis text, trimming: {answer[:60]!r}")
+            idx = answer.find("亲～")
+            answer = answer[idx:] if idx >= 0 else "抱歉，我暂时无法处理这个问题，请稍后再试。"
+
+        # 计算置信度（只看本轮新消息，避免历史污染）
+        confidence = _compute_confidence(new_msgs)
 
         # 确定状态
         status = "success"
@@ -204,6 +242,7 @@ def build_worker(llm: BaseChatModel, tools: list, system_prompt: str, worker_typ
                 confidence=confidence,
                 reroute_to=reroute_to,
                 control_action=control_action,
+                slots=worker_slots,
             )],
         }
 

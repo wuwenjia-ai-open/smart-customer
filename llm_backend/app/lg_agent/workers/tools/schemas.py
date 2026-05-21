@@ -31,9 +31,10 @@ class recommend(BaseModel):
 
 
 class track_shipment(BaseModel):
-    """【物流追踪】查询订单的物流状态和预计到达时间。
-    适用："我的订单发货了吗"、"订单到哪了"。"""
-    order_id: int = Field(..., description="订单号")
+    """【订单查询】凭订单号查订单的全部信息 — 下单时间 / 发货时间 / 收件人 / 商品明细 / 物流状态。
+    适用:任何形如"查订单 #1001"、"我的订单到哪了"、"订单详情"、"发货了吗"、"几号下的单"等问题。
+    **只要有订单号就调这个**,不要因为用户提到"详情"二字就以为没有合适工具。"""
+    order_id: int = Field(..., description="订单号(从用户消息中提取,例如 '订单 #1001' 中提取 1001)")
 
 
 class create_ticket(BaseModel):
@@ -48,11 +49,24 @@ class create_ticket(BaseModel):
 class ask_clarification(BaseModel):
     """【澄清提问】当任务信息不足时，向用户提出精准的澄清问题。
     此工具不执行查询，调用后 Worker 将暂停并等待用户回应。
-    如果发现当前 Worker 无法处理（如 product_qa 收到售后问题），设置 reroute_to。"""
+
+    两种使用方式：
+    1. 澄清（默认）：用户问题属于本 Worker 领域，但缺少必要参数（如缺订单号、缺产品名）。
+       只填 question 和 missing_field，**不要**填 reroute_to。
+    2. 转路由：用户问题**根本不属于**本 Worker 领域（如 product_qa 收到「怎么退货」），
+       此时填 reroute_to=<目标 worker>，让 Supervisor 重新分发。"""
     question: str = Field(..., description="向用户提出的澄清问题，单句，不超过30字")
     missing_field: str = Field(..., description="缺失的关键字段，如'order_id','product_name'")
     options: Optional[List[str]] = Field(default=None, description="可选澄清选项")
-    reroute_to: Optional[str] = Field(default=None, description="如果当前 Worker 无法处理，建议转发的目标 Worker: product_qa|order_qa|after_sales|general_chat")
+    reroute_to: Optional[str] = Field(
+        default=None,
+        description=(
+            "仅当用户问题本质不属于当前 Worker 领域时填写（如 product_qa 收到售后退货问题）。"
+            "**重要**：如果问题属于本 Worker 但只是缺参数（如 order_qa 缺订单号、product_qa 缺产品名），"
+            "必须留空——只通过 question 索取信息即可。"
+            "可选值: product_qa | order_qa | after_sales | general_chat"
+        ),
+    )
 
 
 class escalate_to_human(BaseModel):

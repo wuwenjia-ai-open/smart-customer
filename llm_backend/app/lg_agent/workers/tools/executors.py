@@ -45,7 +45,8 @@ class CompareProductsExecutor:
                     success=False, error="no_results",
                 )
             summary = f"已获取 {len(names)} 个产品的对比数据"
-            return ToolResult(records=records, summary=summary)
+            return ToolResult(records=records, summary=summary,
+                              slots={"products_mentioned": list(names)})
         except Exception as e:
             _log.warning(f"CompareProducts failed: {e}")
             return ToolResult(records=[], summary="", error=str(e), success=False)
@@ -58,11 +59,13 @@ class RecommendExecutor:
         self._svc = product_service
 
     def invoke(self, args: Dict[str, Any]) -> ToolResult:
+        budget_max = args.get("budget_max")
+        budget_min = args.get("budget_min")
         try:
             records = self._svc.recommend(
                 scenario=args.get("scenario", ""),
-                budget_min=args.get("budget_min"),
-                budget_max=args.get("budget_max"),
+                budget_min=budget_min,
+                budget_max=budget_max,
                 preferences=args.get("preferences", []),
                 exclude_names=set(args.get("exclude", [])),
                 top_k=args.get("top_k", 3),
@@ -75,7 +78,12 @@ class RecommendExecutor:
             summary = "推荐 " + ", ".join(
                 f"{r['product_name']}(¥{r.get('price', 'N/A')})" for r in records
             )
-            return ToolResult(records=records, summary=summary)
+            slots: dict = {"products_mentioned": [r["product_name"] for r in records if "product_name" in r]}
+            if budget_max is not None:
+                slots["budget_max"] = budget_max
+            if budget_min is not None:
+                slots["budget_min"] = budget_min
+            return ToolResult(records=records, summary=summary, slots=slots)
         except Exception as e:
             _log.error(f"Recommend failed: {e}")
             return ToolResult(records=[], summary="", error=str(e), success=False)
@@ -100,7 +108,8 @@ class TrackShipmentExecutor:
                 )
             shipped = record.get("o.ShippedDate", "未发货")
             summary = f"订单 #{order_id}: 下单 {record.get('o.OrderDate', '未知')}, 发货状态: {shipped}"
-            return ToolResult(records=[record], summary=summary)
+            return ToolResult(records=[record], summary=summary,
+                              slots={"last_order_id": int(order_id)})
         except Exception as e:
             _log.error(f"TrackShipment failed: {e}")
             return ToolResult(records=[], error=str(e), success=False)
